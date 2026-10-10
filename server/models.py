@@ -240,6 +240,15 @@ class Camera(Base):
     # table of known anamorphic encoder modes. Nullable so the additive column
     # self-heal can add it to old create_all databases.
     display_aspect_ratio = Column(String(16), nullable=True)
+    # Fisheye (360°) lens: NULL for an ordinary camera, else
+    # {"mount": "ceiling"|"wall"|"desk", "center_x", "center_y", "radius",
+    # "fov"} — see schemas.FisheyeLens. Like display_aspect_ratio it is
+    # purely a rendering hint: the browser dewarps the untouched stream on
+    # the GPU, so it never reaches MediaMTX, never re-provisions a path, and
+    # recordings keep the raw circle (every view can be rebuilt from it).
+    # Nullable so the additive column self-heal can add it to old
+    # create_all databases.
+    fisheye = Column(JSON, nullable=True)
     is_active = Column(Boolean, default=True)
     # Tombstone for irreversible soft delete. NULL = live (active or paused);
     # set = camera is in the bin: hidden from every normal list, not editable,

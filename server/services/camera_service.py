@@ -95,6 +95,11 @@ class CameraService:
                     rtsp_url=camera_create.rtsp_url,
                     substream_url=camera_create.substream_url,
                     display_aspect_ratio=camera_create.display_aspect_ratio,
+                    fisheye=(
+                        camera_create.fisheye.model_dump()
+                        if camera_create.fisheye
+                        else None
+                    ),
                     location=camera_create.location,
                     vlan=camera_create.vlan,
                     status=camera_create.status or "unknown",

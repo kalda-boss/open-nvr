@@ -21,6 +21,7 @@ import { apiService } from '../lib/apiService'
 import { rebaseToCurrentOrigin } from '../lib/streamUrl'
 import { VideoPlayer, type VideoPlayerHandle } from '../components/VideoPlayer'
 import type { AspectOverride } from '../lib/aspect'
+import type { FisheyeLens } from '../lib/fisheye'
 import { QrScanner } from '../components/QrScanner'
 import { AddCameraDialog } from '../components/AddCameraDialog'
 import { useFullscreen } from '../hooks/useFullscreen'
@@ -80,7 +81,7 @@ export function LiveView() {
   const { toggle: toggleFs, isFullscreen } = useFullscreen(gridRef as React.RefObject<HTMLDivElement>)
   // FS toolbar visibility — toggled by the bottom-center handle button
   const [fsToolbarVisible, setFsToolbarVisible] = useState(false)
-  const [availableCameras, setAvailableCameras] = useState<Array<{id: number, name: string, live_online?: boolean | null, display_aspect_ratio?: AspectOverride | null}>>([])
+  const [availableCameras, setAvailableCameras] = useState<Array<{id: number, name: string, live_online?: boolean | null, display_aspect_ratio?: AspectOverride | null, fisheye?: FisheyeLens | null}>>([])
   
   // Camera display order - array of camera IDs in display sequence
   // This determines which camera appears in which tile position
@@ -174,6 +175,8 @@ export function LiveView() {
         // The display-aspect override rides along so the tile can render an
         // anamorphic stream at its true shape — see lib/aspect.ts (#354).
         display_aspect_ratio: cam.display_aspect_ratio,
+        // A 360° camera's lens, so its tile can dewarp — see lib/fisheye.ts.
+        fisheye: cam.fisheye ?? null,
       }))
       setAvailableCameras(cameraList)
       
@@ -566,7 +569,7 @@ function Tile({
   showDetections = false,
 }: { 
   index: number
-  availableCameras: Array<{id: number, name: string, live_online?: boolean | null, display_aspect_ratio?: AspectOverride | null}>
+  availableCameras: Array<{id: number, name: string, live_online?: boolean | null, display_aspect_ratio?: AspectOverride | null, fisheye?: FisheyeLens | null}>
   assignedCameraId?: number | null
   onCameraSelected?: (cameraId: number) => void
   onCameraAdded?: () => void
@@ -707,6 +710,7 @@ function Tile({
             muted
             onSnapshot={handleSnapshot}
             displayAspectOverride={assignedCamera?.display_aspect_ratio}
+            fisheye={assignedCamera?.fisheye}
             cameraId={cameraId}
             showDetections={showDetections}
             onTogglePtz={() => setPtzOpen((s) => !s)}

@@ -19,5 +19,8 @@
 export { VideoPlayer } from './VideoPlayer'
 export type { VideoPlayerProps, VideoPlayerHandle, VideoPlayerMode, StreamType } from './VideoPlayer'
 export { AspectFrame } from './AspectFrame'
+export { FisheyeView } from './FisheyeView'
+export type { FisheyeViewHandle } from './FisheyeView'
+export { DewarpMenu } from './DewarpMenu'
 export { VideoControls } from './VideoControls'
 export type { VideoControlsProps } from './VideoControls'

@@ -78,6 +78,32 @@ class UserBase(BaseModel):
         return v
 
 
+class FisheyeLens(BaseModel):
+    """A 360° fisheye camera's lens, for the browser-side dewarp.
+
+    The stream itself is never touched: the UI unwraps the raw circle on the
+    GPU into a panorama or a virtual PTZ view, so these values only tell it
+    where the circle sits in the frame and how the camera is hung. The
+    defaults fit the usual encoder output — a circle inscribed in the
+    frame's shorter side, centred — so most cameras need only ``mount``.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    # Which way the lens faces. Decides what "level" and "up" mean for the
+    # dewarped views: a ceiling dome looks down, a desk unit looks up, a
+    # wall unit looks out horizontally.
+    mount: Literal["ceiling", "wall", "desk"] = "ceiling"
+    # Image-circle centre, as fractions of the frame's width and height.
+    center_x: float = Field(0.5, ge=0.0, le=1.0)
+    center_y: float = Field(0.5, ge=0.0, le=1.0)
+    # Image-circle radius as a fraction of the frame's SHORTER side, so 0.5
+    # is a circle exactly inscribed in it; above 0.5 the circle is cropped.
+    radius: float = Field(0.5, ge=0.1, le=1.0)
+    # Lens field of view across the full circle, in degrees.
+    fov: float = Field(180.0, ge=120.0, le=240.0)
+
+
 class CameraBase(BaseModel):
     """Base camera schema with common fields."""
 
@@ -92,6 +118,8 @@ class CameraBase(BaseModel):
     substream_url: str | None = Field(None, max_length=500)
     # Display-only aspect hint; see _validate_display_aspect.
     display_aspect_ratio: str | None = Field(None, max_length=16)
+    # Display-only fisheye lens description; None = an ordinary camera.
+    fisheye: FisheyeLens | None = None
     location: str | None = Field(None, max_length=200)
     vlan: str | None = Field(None, max_length=50)
     status: str | None = Field("unknown", max_length=20)
@@ -464,6 +492,8 @@ class CameraUpdate(BaseModel):
     substream_url: str | None = Field(None, max_length=500)
     # Display-only aspect hint; "auto"/"" normalize to None (auto-detect).
     display_aspect_ratio: str | None = Field(None, max_length=16)
+    # Display-only fisheye lens; send null to turn dewarping off.
+    fisheye: FisheyeLens | None = None
     location: str | None = Field(None, max_length=200)
     vlan: str | None = Field(None, max_length=50)
     status: str | None = Field(None, max_length=20)
