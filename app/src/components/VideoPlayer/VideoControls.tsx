@@ -23,6 +23,8 @@ import {
   Loader2, Move
 } from 'lucide-react'
 import { useTranslation } from '../../i18n'
+import type { DewarpMode } from '../../lib/fisheye'
+import { DewarpMenu } from './DewarpMenu'
 
 export interface VideoControlsProps {
   videoRef: React.RefObject<HTMLVideoElement | null>
@@ -50,6 +52,11 @@ export interface VideoControlsProps {
   /** Present only when the camera supports PTZ; toggles the PTZ pad */
   onTogglePtz?: () => void
   ptzActive?: boolean
+  /** Fisheye layouts on offer; empty (the default) hides the picker. */
+  dewarpModes?: DewarpMode[]
+  dewarpMode?: DewarpMode
+  onDewarpModeChange?: (mode: DewarpMode) => void
+  onDewarpReset?: () => void
 }
 
 export function VideoControls({
@@ -77,6 +84,10 @@ export function VideoControls({
   availableStreamTypes = [],
   onTogglePtz,
   ptzActive = false,
+  dewarpModes = [],
+  dewarpMode = 'fisheye',
+  onDewarpModeChange,
+  onDewarpReset,
 }: VideoControlsProps) {
   const { t } = useTranslation()
   const [showVolumeSlider, setShowVolumeSlider] = useState(false)
@@ -308,6 +319,17 @@ export function VideoControls({
               {streamType}
             </span>
           )
+        )}
+
+        {/* Fisheye layout picker (fisheye cameras only). Outlives snapshot:
+            on a 360° camera it decides whether the tile is usable at all. */}
+        {onDewarpModeChange && dewarpModes.length > 0 && (
+          <DewarpMenu
+            modes={dewarpModes}
+            mode={dewarpMode}
+            onChange={onDewarpModeChange}
+            onReset={onDewarpReset}
+          />
         )}
 
         {/* Snapshot */}

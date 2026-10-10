@@ -6,6 +6,21 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **360° fisheye cameras dewarp in the browser.** Set a camera's **Lens**
+  to "360° fisheye" (ceiling, wall or desk mount) and Live View, Playback,
+  Sync Playback and the dashboard wall flatten the raw circle on the GPU,
+  the way a 360° camera's own app does (e.g. Illumivue IP5VD360):
+  a 360° or dual 180° panorama, a virtual PTZ you drag to pan and tilt and
+  scroll or pinch to zoom, and a quad of four PTZ views. The aperture
+  button on the player switches layouts, and each camera's layout and aim
+  are remembered per browser. Display only: the stream, MediaMTX and
+  recordings are untouched, so saving the setting never restarts the
+  stream, and recordings can be dewarped any way later. Lens calibration
+  (circle centre and radius, field of view) is available under the setting
+  for cameras whose circle isn't centred in the frame.
+
 ### Changed
 
 - **Camera-agent model advice is measured, not remembered.** Ten small

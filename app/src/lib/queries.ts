@@ -24,6 +24,7 @@ import { useMemo } from 'react'
 import { QueryClient, keepPreviousData, useQueries, useQuery } from '@tanstack/react-query'
 import { apiService } from './apiService'
 import type { AspectOverride } from './aspect'
+import type { FisheyeLens } from './fisheye'
 import { todayLocalKey } from './time'
 import { alertsInboxService, type InboxAlert } from '../services/alertsInboxService'
 
@@ -56,12 +57,15 @@ export type CameraItem = {
   last_recording_at?: string | null
   /** Operator's display-aspect override; null means auto-detect (#354). */
   display_aspect_ratio?: AspectOverride | null
+  /** 360° fisheye lens, for the browser-side dewarp; null = ordinary camera. */
+  fisheye?: FisheyeLens | null
 }
 
 /** What a video surface needs to render a camera at the right shape. A named
  *  type so the props can be spread at every call site as one unit. */
 export type CameraAspect = {
   displayAspectOverride?: AspectOverride | null
+  fisheye?: FisheyeLens | null
 }
 
 export type CameraListResp = { cameras: CameraItem[]; total: number }
@@ -118,7 +122,10 @@ export function useCameraAspects(): Record<number, CameraAspect> {
   return useMemo(() => {
     const out: Record<number, CameraAspect> = {}
     for (const c of data?.cameras ?? []) {
-      out[c.id] = { displayAspectOverride: c.display_aspect_ratio ?? null }
+      out[c.id] = {
+        displayAspectOverride: c.display_aspect_ratio ?? null,
+        fisheye: c.fisheye ?? null,
+      }
     }
     return out
   }, [data])

@@ -392,6 +392,71 @@ def test_display_aspect_rejects_junk(env):
     assert env.calls == []
 
 
+def test_fisheye_change_does_not_reprovision(env):
+    """Dewarping happens in the browser, on the untouched stream. Marking a
+    camera as a fisheye only changes how tiles render it, so it must never
+    bounce the path and drop every viewer."""
+    cam = env.make_camera()
+    resp = env.client.put(
+        f"/api/v1/cameras/{cam.id}",
+        json=_full_form(cam, fisheye={"mount": "ceiling"}),
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert env.calls == []
+    assert resp.json()["stream_action"] in (None, "none")
+    # Unsent calibration fields come back filled with the defaults, so the
+    # UI never has to know them.
+    assert resp.json()["fisheye"] == {
+        "mount": "ceiling",
+        "center_x": 0.5,
+        "center_y": 0.5,
+        "radius": 0.5,
+        "fov": 180.0,
+    }
+
+    env.db.expire_all()
+    assert env.db.get(Camera, cam.id).fisheye["mount"] == "ceiling"
+
+
+def test_fisheye_null_turns_dewarping_off(env):
+    cam = env.make_camera()
+    env.client.put(
+        f"/api/v1/cameras/{cam.id}",
+        json=_full_form(cam, fisheye={"mount": "wall", "radius": 0.62}),
+        headers=_auth(),
+    )
+    resp = env.client.put(
+        f"/api/v1/cameras/{cam.id}",
+        json=_full_form(cam, fisheye=None),
+        headers=_auth(),
+    )
+    assert resp.status_code == 200, resp.text
+    env.db.expire_all()
+    assert env.db.get(Camera, cam.id).fisheye is None
+
+
+@pytest.mark.parametrize(
+    "fisheye",
+    [
+        {"mount": "floor"},
+        {"mount": "ceiling", "radius": 0},
+        {"mount": "ceiling", "center_x": 1.5},
+        {"mount": "ceiling", "fov": 360},
+        {"mount": "ceiling", "zoom": 2},
+    ],
+)
+def test_fisheye_rejects_junk(env, fisheye):
+    cam = env.make_camera()
+    resp = env.client.put(
+        f"/api/v1/cameras/{cam.id}",
+        json=_full_form(cam, fisheye=fisheye),
+        headers=_auth(),
+    )
+    assert resp.status_code == 422, resp.text
+    assert env.calls == []
+
+
 def test_ip_change_in_id_path_mode_does_not_repath(env, monkeypatch):
     """In the default mode the path is cam-<id>: the address never reaches
     MediaMTX as data, so moving a camera costs no round trip."""

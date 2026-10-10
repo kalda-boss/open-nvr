@@ -32,8 +32,12 @@ import { resolveWhepSessionUrl } from '../../lib/streamUrl'
 import { displayAspect, isStretched, snapshotSize } from '../../lib/aspect'
 import type { AspectOverride } from '../../lib/aspect'
 import { useVideoSize } from '../../hooks/useVideoAspect'
+import { useDewarp } from '../../hooks/useDewarp'
+import type { FisheyeLens } from '../../lib/fisheye'
 import { VideoControls } from './VideoControls'
 import { DetectionOverlay } from './DetectionOverlay'
+import { FisheyeView } from './FisheyeView'
+import type { FisheyeViewHandle } from './FisheyeView'
 import { AlertCircle } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 
@@ -84,6 +88,10 @@ export interface VideoPlayerProps {
   /** Operator's per-camera display-aspect override ('auto' | 'native' | 'W:H').
       Absent or 'auto' runs the detection in lib/aspect.ts (issue #354). */
   displayAspectOverride?: AspectOverride | null
+  /** The camera's 360° fisheye lens, if it has one. Turns on the dewarped
+      layouts (panorama, virtual PTZ…) and their picker; null/absent leaves
+      the player exactly as it is for an ordinary camera. */
+  fisheye?: FisheyeLens | null
   /** Core camera id — needed to subscribe this tile to its live tracks. */
   cameraId?: number | null
   /** Draw Tier-0 bounding boxes with label + score over the video.
@@ -132,6 +140,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       ptzActive = false,
       overlay,
       displayAspectOverride,
+      fisheye = null,
       cameraId = null,
       showDetections = false,
       chrome = 'full',
@@ -213,6 +222,13 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     // rather than letterboxed. Drives object-fit on the <video> below.
     const stretched = isStretched(videoSize?.width, videoSize?.height, videoAspect)
 
+    // Fisheye dewarping. While a dewarped layout is showing, the GPU canvas
+    // fills the whole tile (a panorama has no business being boxed into the
+    // lens circle's 1:1 or 4:3), so the box below drops its aspect lock.
+    const dewarp = useDewarp(cameraId, fisheye)
+    const fisheyeRef = useRef<FisheyeViewHandle>(null)
+    const boxAspect = dewarp.active ? null : videoAspect
+
     /** JPEG of the current frame at the CORRECTED width. An anamorphic stream
         has to be un-squished in the export too, or the saved file looks nothing
         like the tile it was taken from; drawImage's explicit destination rect
@@ -220,6 +236,10 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     const captureSnapshot = useCallback((): string | null => {
       const el = videoRef.current
       if (!el || el.readyState < 2) return null
+      // A dewarped tile exports what the operator is looking at.
+      if (dewarp.active) {
+        return fisheyeRef.current?.capture()?.toDataURL('image/jpeg', 0.92) ?? null
+      }
       const codedW = el.videoWidth || el.clientWidth
       const codedH = el.videoHeight || el.clientHeight
       if (!codedW || !codedH) return null
@@ -236,7 +256,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         return null
       }
       return canvas.toDataURL('image/jpeg', 0.92)
-    }, [displayAspectOverride])
+    }, [displayAspectOverride, dewarp.active])
 
     // Determine available stream types
     const availableStreamTypes: Array<'webrtc' | 'hls'> = []
@@ -1076,8 +1096,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         <div
           className="relative flex justify-center"
           style={
-            videoAspect
-              ? { width: '100%', height: `min(100%, calc(100cqw / ${videoAspect}))`, containerType: 'inline-size' }
+            boxAspect
+              ? { width: '100%', height: `min(100%, calc(100cqw / ${boxAspect}))`, containerType: 'inline-size' }
               : { width: '100%', height: '100%', containerType: 'inline-size' }
           }
         >
@@ -1086,7 +1106,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             min-w-0 keeps the video's intrinsic size from inflating it. */}
         <div
           className="relative h-full min-w-0 bg-black"
-          style={videoAspect ? { aspectRatio: String(videoAspect) } : { width: '100%' }}
+          style={boxAspect ? { aspectRatio: String(boxAspect) } : { width: '100%' }}
         >
 
         {/* Video element. The feed box already carries the stream's DISPLAY
@@ -1105,11 +1125,32 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
           preload={mode === 'playback' ? 'metadata' : 'auto'}
         />
 
+        {/* Dewarped fisheye, drawn over the still-decoding video. Keyed by
+            camera so a reused player never carries one camera's aim to the
+            next. Not interactive on bare glance surfaces, whose caller owns
+            pointer input (e.g. the dashboard grid's drag handles). */}
+        {dewarp.active && dewarp.lens && dewarp.views && (
+          <FisheyeView
+            key={cameraId ?? 'none'}
+            ref={fisheyeRef}
+            videoRef={videoRef}
+            lens={dewarp.lens}
+            mode={dewarp.mode}
+            views={dewarp.views}
+            onViewsChange={dewarp.saveViews}
+            onUnsupported={dewarp.markUnsupported}
+            interactive={!bare}
+            className="absolute inset-0 w-full h-full"
+          />
+        )}
+
         {/* Detection overlay — INSIDE the feed box so its rectangle is the
             video's rectangle and normalized boxes need no letterbox math.
             Below the loading/error overlays in the tree, so those still
-            cover it. Live only: recordings carry no live tracks. */}
-        {mode === 'live' && showDetections && cameraId != null && (
+            cover it. Live only: recordings carry no live tracks. Not over a
+            dewarped view: the boxes are in the raw circle's coordinates and
+            would land in the wrong place. */}
+        {mode === 'live' && showDetections && cameraId != null && !dewarp.active && (
           <DetectionOverlay cameraId={cameraId} />
         )}
 
@@ -1249,6 +1290,10 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             availableStreamTypes={availableStreamTypes}
             onTogglePtz={onTogglePtz}
             ptzActive={ptzActive}
+            dewarpModes={dewarp.modes}
+            dewarpMode={dewarp.mode}
+            onDewarpModeChange={dewarp.setMode}
+            onDewarpReset={() => fisheyeRef.current?.reset()}
           />
         </div>}
         </div>

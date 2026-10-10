@@ -36,6 +36,8 @@ import { AddCameraDialog } from '../components/AddCameraDialog'
 import { QrScanner } from '../components/QrScanner'
 import { parseCameraQr } from '../lib/cameraQr'
 import { ASPECT_OPTIONS, isCustomAspect } from '../lib/aspect'
+import { DEFAULT_LENS } from '../lib/fisheye'
+import type { FisheyeLens, FisheyeMount } from '../lib/fisheye'
 import { parseRtspUrl, rtspPortFromUrl, syncCameraIdentity } from '../lib/cameraIdentity'
 import type { IdentityField } from '../lib/cameraIdentity'
 import { formatDuration } from '../lib/time'
@@ -58,6 +60,8 @@ type Camera = {
   substream_url?: string | null
   /** Display-only aspect override; null = auto-detect. See lib/aspect.ts. */
   display_aspect_ratio?: string | null
+  /** 360° fisheye lens; null = ordinary camera. See lib/fisheye.ts. */
+  fisheye?: FisheyeLens | null
   location?: string | null
   vlan?: string | null
   status?: string | null
@@ -105,6 +109,37 @@ function aspectValueOf(form: CameraForm): string | null {
   return choice
 }
 
+/** Lens fields as the form shows them: percentages and degrees, kept as
+ *  strings so a half-typed number survives a re-render. */
+function fisheyeFormOf(lens: FisheyeLens | null | undefined): Partial<CameraForm> {
+  const l = { ...DEFAULT_LENS, ...lens }
+  const pct = (v: number) => String(Math.round(v * 1000) / 10)
+  return {
+    fisheye_mount: lens?.mount ?? '',
+    fisheye_center_x: pct(l.center_x),
+    fisheye_center_y: pct(l.center_y),
+    fisheye_radius: pct(l.radius),
+    fisheye_fov: String(l.fov),
+  }
+}
+
+/** The value to persist: null for an ordinary lens. A blank or unparsable
+ *  calibration box falls back to its default rather than failing the save. */
+function fisheyeValueOf(form: CameraForm): FisheyeLens | null {
+  if (!form.fisheye_mount) return null
+  const num = (v: string | undefined, fallback: number, scale = 1) => {
+    const n = Number(v)
+    return v?.trim() && Number.isFinite(n) ? n / scale : fallback
+  }
+  return {
+    mount: form.fisheye_mount,
+    center_x: num(form.fisheye_center_x, DEFAULT_LENS.center_x, 100),
+    center_y: num(form.fisheye_center_y, DEFAULT_LENS.center_y, 100),
+    radius: num(form.fisheye_radius, DEFAULT_LENS.radius, 100),
+    fov: num(form.fisheye_fov, DEFAULT_LENS.fov),
+  }
+}
+
 type CameraForm = {
   name: string
   description?: string
@@ -118,6 +153,13 @@ type CameraForm = {
   display_aspect_choice?: string
   /** Free-form "W:H", only meaningful while display_aspect_choice is 'custom'. */
   display_aspect_custom?: string
+  /** '' = ordinary lens, else the fisheye's mount. */
+  fisheye_mount?: '' | FisheyeMount
+  /** Circle centre and radius in %, FOV in degrees — see fisheyeFormOf. */
+  fisheye_center_x?: string
+  fisheye_center_y?: string
+  fisheye_radius?: string
+  fisheye_fov?: string
   location?: string
   vlan?: string
   status?: string
@@ -362,6 +404,7 @@ export function Cameras() {
         rtsp_url: form.rtsp_url || null,
         substream_url: form.substream_url || null,
         display_aspect_ratio: aspectValueOf(form),
+        fisheye: fisheyeValueOf(form),
         location: form.location || null,
         vlan: form.vlan || null,
         status: form.status || undefined,
@@ -481,6 +524,7 @@ export function Cameras() {
       display_aspect_custom: isCustomAspect(c.display_aspect_ratio)
         ? (c.display_aspect_ratio as string)
         : '',
+      ...fisheyeFormOf(c.fisheye),
       location: c.location || '',
       vlan: c.vlan || '',
       status: c.status || 'unknown',
@@ -915,6 +959,61 @@ export function Cameras() {
                 <p className="text-xs text-[var(--muted)]">
                   How OpenNVR shows this camera. Display only — recordings are
                   stored exactly as the camera sends them.
+                </p>
+              </div>
+              )}
+            </Field>
+
+            {/* Display only, like the aspect: the browser dewarps the raw
+                lens circle on the GPU, so saving this never touches the
+                stream, and recordings keep the full circle to dewarp later. */}
+            <Field label="Lens">
+              {(id) => (
+              <div className="space-y-1">
+                <Select
+                  id={id}
+                  value={form.fisheye_mount || ''}
+                  onChange={(e) => setForm({ ...form, fisheye_mount: e.target.value as CameraForm['fisheye_mount'] })}
+                >
+                  <option value="">Standard</option>
+                  <option value="ceiling">360° fisheye, ceiling mount</option>
+                  <option value="wall">360° fisheye, wall mount</option>
+                  <option value="desk">360° fisheye, desk or floor mount</option>
+                </Select>
+                {form.fisheye_mount && (
+                  <details className="pt-1">
+                    <summary className="cursor-pointer text-xs text-[var(--muted)]">Lens calibration</summary>
+                    <div className="grid grid-cols-2 gap-2 pt-2">
+                      {([
+                        ['fisheye_center_x', 'Circle centre X (%)', 0, 100, 0.1],
+                        ['fisheye_center_y', 'Circle centre Y (%)', 0, 100, 0.1],
+                        ['fisheye_radius', 'Circle radius (% of short side)', 10, 100, 0.1],
+                        ['fisheye_fov', 'Lens field of view (°)', 120, 240, 1],
+                      ] as const).map(([key, label, min, max, step]) => (
+                        <label key={key} className="space-y-1 text-xs text-[var(--muted)]">
+                          <span className="block">{label}</span>
+                          <Input
+                            type="number"
+                            min={min}
+                            max={max}
+                            step={step}
+                            value={form[key] ?? ''}
+                            onChange={(e) => setForm({ ...form, [key]: e.target.value })}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                    <p className="pt-1 text-xs text-[var(--muted)]">
+                      The defaults fit a circle centred in the frame and
+                      touching its shorter edges. Adjust them if straight
+                      lines bend in the flattened views.
+                    </p>
+                  </details>
+                )}
+                <p className="text-xs text-[var(--muted)]">
+                  A 360° camera gets panorama and drag-to-look views in Live
+                  View and Playback. Display only — recordings keep the
+                  original circle.
                 </p>
               </div>
               )}

@@ -124,6 +124,7 @@ function LiveTile({ cam, spotlit, onSpotlight, playing }: {
           autoPlay
           muted
           displayAspectOverride={cam.display_aspect_ratio}
+          fisheye={cam.fisheye}
           cameraId={cam.id}
           className="w-full h-full !bg-black"
         />

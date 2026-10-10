@@ -23,7 +23,10 @@ import { apiService } from '../lib/apiService'
 import { displayAspect, isStretched } from '../lib/aspect'
 import type { AspectOverride } from '../lib/aspect'
 import { useVideoSize } from '../hooks/useVideoAspect'
-import { AspectFrame } from './VideoPlayer'
+import { useDewarp } from '../hooks/useDewarp'
+import type { FisheyeLens } from '../lib/fisheye'
+import { AspectFrame, DewarpMenu, FisheyeView } from './VideoPlayer'
+import type { FisheyeViewHandle } from './VideoPlayer'
 import { useTranslation } from '../i18n'
 import { loadHls } from '../lib/loadHls'
 import type { TimelineSegment } from './PlaybackTimeline'
@@ -45,6 +48,8 @@ interface SyncPlaybackTileProps {
   onActivate: () => void
   /** Per-camera display-aspect override — see lib/aspect.ts (issue #354). */
   displayAspectOverride?: AspectOverride | null
+  /** 360° fisheye lens — see lib/fisheye.ts. */
+  fisheye?: FisheyeLens | null
 }
 
 type TileStatus = 'idle' | 'loading' | 'ok' | 'gap' | 'live' | 'error'
@@ -71,6 +76,7 @@ export function SyncPlaybackTile({
   active,
   onActivate,
   displayAspectOverride,
+  fisheye,
 }: SyncPlaybackTileProps) {
   const { t } = useTranslation()
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -378,6 +384,8 @@ export function SyncPlaybackTile({
     [videoSize?.width, videoSize?.height, displayAspectOverride]
   )
   const stretched = isStretched(videoSize?.width, videoSize?.height, videoAspect)
+  const dewarp = useDewarp(cameraId, fisheye)
+  const fisheyeRef = useRef<FisheyeViewHandle>(null)
 
   const showSpinner = status === 'loading' || (status === 'ok' && buffering)
 
@@ -389,14 +397,40 @@ export function SyncPlaybackTile({
     >
       {/* The clip carries the camera's coded size, which for an anamorphic
           stream is not the size to show it at — see lib/aspect.ts (#354). */}
-      <AspectFrame aspect={videoAspect}>
+      <AspectFrame aspect={dewarp.active ? null : videoAspect}>
         <video
           ref={videoRef}
           className={`block w-full h-full ${stretched ? 'object-fill' : 'object-contain'}`}
           playsInline
           crossOrigin="anonymous"
         />
+        {dewarp.active && dewarp.lens && dewarp.views && (
+          <FisheyeView
+            ref={fisheyeRef}
+            videoRef={videoRef}
+            lens={dewarp.lens}
+            mode={dewarp.mode}
+            views={dewarp.views}
+            onViewsChange={dewarp.saveViews}
+            onUnsupported={dewarp.markUnsupported}
+            className="absolute inset-0 w-full h-full"
+          />
+        )}
       </AspectFrame>
+
+      {dewarp.modes.length > 0 && (
+        <div className="absolute right-1 top-1 z-30 text-white/80">
+          <DewarpMenu
+            modes={dewarp.modes}
+            mode={dewarp.mode}
+            onChange={dewarp.setMode}
+            onReset={() => fisheyeRef.current?.reset()}
+            placement="down"
+            buttonClassName="p-1 rounded bg-black/40 hover:bg-black/60 transition-colors"
+            iconSize={14}
+          />
+        </div>
+      )}
 
       {/* Label band, as on Live View and the dashboard wall: legible over
           any picture without a solid bar. The speaker marks the tile whose

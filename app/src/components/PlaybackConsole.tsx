@@ -41,7 +41,10 @@ import { apiService } from '../lib/apiService'
 import { displayAspect, isStretched } from '../lib/aspect'
 import type { AspectOverride } from '../lib/aspect'
 import { useVideoSize } from '../hooks/useVideoAspect'
-import { AspectFrame } from './VideoPlayer'
+import { useDewarp } from '../hooks/useDewarp'
+import type { FisheyeLens } from '../lib/fisheye'
+import { AspectFrame, DewarpMenu, FisheyeView } from './VideoPlayer'
+import type { FisheyeViewHandle } from './VideoPlayer'
 import { loadHls, warmHls } from '../lib/loadHls'
 import { useCameraSegments } from '../lib/queries'
 import { localDayEnd, localDayStart } from '../lib/time'
@@ -70,6 +73,9 @@ interface PlaybackConsoleProps {
       camera sent them, so an anamorphic stream plays back squished without it
       (issue #354). Omitted for a deleted camera — detection still applies. */
   displayAspectOverride?: AspectOverride | null
+  /** 360° fisheye lens; recordings keep the raw circle, so playback dewarps
+      exactly like live does. */
+  fisheye?: FisheyeLens | null
 }
 
 // Zoom presets (visible span in ms) — mirrors the "1 Day / …" control.
@@ -112,6 +118,7 @@ export function PlaybackConsole({
   date,
   onClose,
   displayAspectOverride,
+  fisheye,
 }: PlaybackConsoleProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -132,6 +139,9 @@ export function PlaybackConsole({
     [videoSize?.width, videoSize?.height, displayAspectOverride]
   )
   const stretched = isStretched(videoSize?.width, videoSize?.height, videoAspect)
+  // Same per-camera layout and aim as Live View (shared via localStorage).
+  const dewarp = useDewarp(cameraId, fisheye)
+  const fisheyeRef = useRef<FisheyeViewHandle>(null)
   const sessionIdRef = useRef<string | null>(null)
   // Guards against out-of-order async loads: only the latest load token wins.
   const loadTokenRef = useRef(0)
@@ -742,7 +752,7 @@ export function PlaybackConsole({
             </div>
           ) : (
             <>
-              <AspectFrame aspect={videoAspect}>
+              <AspectFrame aspect={dewarp.active ? null : videoAspect}>
                 <video
                   ref={videoRef}
                   className={`block w-full h-full ${stretched ? 'object-fill' : 'object-contain'}`}
@@ -750,6 +760,19 @@ export function PlaybackConsole({
                   crossOrigin="anonymous"
                   onClick={togglePlay}
                 />
+                {dewarp.active && dewarp.lens && dewarp.views && (
+                  <FisheyeView
+                    ref={fisheyeRef}
+                    videoRef={videoRef}
+                    lens={dewarp.lens}
+                    mode={dewarp.mode}
+                    views={dewarp.views}
+                    onViewsChange={dewarp.saveViews}
+                    onUnsupported={dewarp.markUnsupported}
+                    onTap={togglePlay}
+                    className="absolute inset-0 w-full h-full"
+                  />
+                )}
               </AspectFrame>
               {(loading || buffering) && !livePrompt && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/30 pointer-events-none">
@@ -831,6 +854,17 @@ export function PlaybackConsole({
             >
               <Scissors size={16} />
             </button>
+
+            {dewarp.modes.length > 0 && (
+              <DewarpMenu
+                modes={dewarp.modes}
+                mode={dewarp.mode}
+                onChange={dewarp.setMode}
+                onReset={() => fisheyeRef.current?.reset()}
+                buttonClassName="p-1.5 rounded transition-colors hover:bg-[var(--panel)]"
+                iconSize={16}
+              />
+            )}
 
             <div className="flex-1" />
 
