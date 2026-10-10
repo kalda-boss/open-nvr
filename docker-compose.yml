@@ -539,7 +539,20 @@ services:
   # OpenNVR core — backend + frontend + KAI-C.
   # ──────────────────────────────────────────────────────────────
   opennvr-core:
-    image: ghcr.io/open-nvr/core:${CORE_TAG:-latest}
+    # This fork builds its own core (scripts/deploy.sh, docs/FORK_DEPLOY.md)
+    # instead of running upstream's ghcr.io/open-nvr/core. The image lives in
+    # the fork owner's namespace so `pull_policy: missing` can only ever
+    # fetch an image this account published, and its tag is FORK_CORE_TAG —
+    # NOT CORE_TAG, which also selects upstream's detect-pipeline image and
+    # must keep naming a tag upstream actually publishes.
+    image: ghcr.io/kalda-boss/open-nvr-core:${FORK_CORE_TAG:-latest}
+    # Local image if present; otherwise try the registry; otherwise build
+    # from this checkout. Also makes `compose pull --ignore-buildable` (the
+    # installer) skip core instead of failing on an unpublished tag.
+    pull_policy: missing
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: opennvr_core
     logging: *svc-logs
     restart: unless-stopped
