@@ -668,9 +668,13 @@ for fn in ("docker-compose.yml",):
     if has_build:
         if not (has_image and pp == "missing"):
             bad.append(f"{fn}: image={has_image} pull_policy={pp!r}")
-    # Whenever image: is set, it should reference our GHCR namespace.
-    if has_image and not img.startswith("ghcr.io/open-nvr/core"):
-        bad.append(f"{fn}: image={img!r} not under ghcr.io/open-nvr/core")
+    # Whenever image: is set, it should reference a namespace we control:
+    # upstream's, or this fork's own (which builds core itself).
+    if has_image and not img.startswith(
+        ("ghcr.io/open-nvr/core", "ghcr.io/kalda-boss/open-nvr-core")
+    ):
+        bad.append(f"{fn}: image={img!r} not under ghcr.io/open-nvr/core "
+                   f"or ghcr.io/kalda-boss/open-nvr-core")
 print("\n".join(bad))
 PY
 )
