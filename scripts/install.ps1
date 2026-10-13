@@ -956,8 +956,13 @@ function Pull-AndBuild {
         # Without it the bundled ollama/ollama-model-pull services are still
         # in an ACTIVE profile here, so `pull` downloads the 3.7 GB
         # ollama/ollama image for containers the launcher then never starts.
-        if ((Get-EnvValue OLLAMA_EXTERNAL_URL) -and $script:ExampleCompose -like '*camera-agent.yml*') {
-            $script:ComposeArgs += @('-f', 'docker-compose.camera-agent.external-llm.yml')
+        # LLM_PROVIDER=anthropic swaps it for the Claude overlay.
+        if ($script:ExampleCompose -like '*camera-agent.yml*') {
+            if (((Get-EnvValue LLM_PROVIDER) -replace '\s*#.*$', '').Trim() -eq 'anthropic') {
+                $script:ComposeArgs += @('-f', 'docker-compose.anthropic.yml')
+            } elseif (Get-EnvValue OLLAMA_EXTERNAL_URL) {
+                $script:ComposeArgs += @('-f', 'docker-compose.camera-agent.external-llm.yml')
+            }
         }
         foreach ($p in @($script:ExampleProfile -split ',' | Where-Object { $_ })) { $script:ComposeArgs += @('--profile', $p) }
         Info "Pulling images for $script:ExampleName..."

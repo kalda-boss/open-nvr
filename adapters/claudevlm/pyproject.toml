@@ -1,0 +1,26 @@
+# Test environment for the claudevlm adapter. The image does not use this
+# (see Dockerfile); it pins the same versions so the tests match it.
+[project]
+name = "opennvr-claudevlm-adapter"
+version = "1.0.0"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0" }
+dependencies = [
+    "opennvr-adapter-sdk==1.3.0",
+    "anthropic==1.13.0",
+    "fastapi==0.127.0",
+    "pydantic==2.12.5",
+    "httpx==0.28.1",
+    "python-multipart==0.0.20",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Repo root, so tests import ``adapters.claudevlm`` like the image does.
+pythonpath = ["../.."]

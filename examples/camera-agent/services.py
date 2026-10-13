@@ -308,6 +308,13 @@ class OpenNvrOllamaLLM(LLMService):
                 if content:
                     await self.push_frame(LLMTextFrame(content))
 
+                # Mirror the assistant turn too: a tool result with no
+                # tool call before it is an orphan the next utterance
+                # sends back — Ollama shrugs, the Messages API refuses it.
+                context.add_message({
+                    "role": "assistant", "content": content, "tool_calls": tool_calls,
+                })
+
                 # Execute each tool call and append its result.
                 for call in tool_calls:
                     name, result = await self._invoke_tool(call)

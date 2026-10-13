@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from typing import Any
@@ -644,6 +645,23 @@ class OllamaClient(_ReusableClientMixin):
         return resp.json()
 
 
+def _json_string_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The turn loop's routed/forced calls carry ``arguments`` as a dict
+    (Ollama's shape); the OpenAI wire format wants a JSON string."""
+    out = []
+    for msg in messages:
+        calls = msg.get("tool_calls")
+        if calls and any(isinstance((c.get("function") or {}).get("arguments"), dict)
+                         for c in calls):
+            msg = {**msg, "tool_calls": [
+                {**c, "function": {**c["function"],
+                                   "arguments": json.dumps(c["function"]["arguments"])}}
+                if isinstance((c.get("function") or {}).get("arguments"), dict) else c
+                for c in calls]}
+        out.append(msg)
+    return out
+
+
 class OpenAILLMClient(_ReusableClientMixin):
     """Cloud/hybrid LLM brain via any OpenAI-compatible chat API — OpenAI,
     Groq, Together, OpenRouter, or a local OpenAI-API server (vLLM, llama.cpp,
@@ -677,7 +695,7 @@ class OpenAILLMClient(_ReusableClientMixin):
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         body: dict[str, Any] = {
-            "model": self._model, "messages": messages,
+            "model": self._model, "messages": _json_string_arguments(messages),
             "temperature": temperature, "max_tokens": max_tokens,
         }
         if tools:
@@ -694,6 +712,226 @@ class OpenAILLMClient(_ReusableClientMixin):
         if message.get("content") is None:
             message["content"] = ""
         return {"message": message}
+
+
+class LLMCallError(RuntimeError):
+    """A provider SDK call failed. ``status`` is the HTTP status when the
+    provider answered (None when it was never reached) — the turn loop
+    turns it into the same human-readable diagnosis as an httpx error."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class AnthropicLLMClient:
+    """Claude brain via the official Anthropic SDK (``llm_provider:
+    anthropic``). Same ``chat()`` contract as the Ollama/OpenAI clients:
+    the turn loop speaks OpenAI-shaped messages and tool definitions, and
+    gets back ``{"message": {"role", "content", "tool_calls"?}}``. This
+    class translates both ways so the loops stay provider-agnostic.
+
+    Choices the Messages API forces, kept here so callers needn't know:
+
+    * **No sampling parameters.** Claude Haiku 5.5 rejects a non-default
+      ``temperature``; depth is set with ``effort`` instead (default
+      "low" — short tool-calling turns don't repay more thinking).
+    * **Thinking is replayed.** Thinking stays on (adaptive), and an
+      assistant turn that called tools must go back with its thinking
+      blocks unchanged. The loops rebuild assistant turns from
+      ``content`` + ``tool_calls`` only, so the raw blocks are kept here,
+      keyed by tool-call id, and swapped back in on the next request.
+    * **Tool exchanges Claude didn't make become text.** The loops inject
+      calls of their own (the router's ``route-0``, forced grounding's
+      ``forced-0``), and the tier-0 compose call sends tool history with
+      no tool definitions. A tool_use block needs tools defined, and with
+      thinking on it must arrive with the thinking that produced it — so
+      only calls replayed from a real response stay structured; the rest
+      (and their results) are flattened to plain text.
+    * **max_tokens has a floor.** Thinking counts against it, and the
+      local-model default (256) can end a turn before the answer starts.
+      A request for <= 1 token is the pre-warm: sent as ``max_tokens=0``,
+      which writes the prompt cache and generates nothing.
+    """
+
+    MIN_MAX_TOKENS = 2048
+    _REPLAY_CAP = 256
+
+    def __init__(self, *, api_key: str | None, model: str,
+                 effort: str = "low", base_url: str | None = None,
+                 timeout_seconds: float = 60.0) -> None:
+        import anthropic  # lazy: only this provider needs the SDK
+
+        self._anthropic = anthropic
+        # api_key=None → the SDK reads ANTHROPIC_API_KEY from the environment.
+        # One retry: someone is waiting on this turn, often by voice.
+        self._sdk = anthropic.AsyncAnthropic(
+            api_key=api_key or None, base_url=base_url or None,
+            timeout=timeout_seconds, max_retries=1)
+        self._model = model
+        self._effort = effort or "low"
+        # tool-call id → the assistant content blocks that issued it.
+        self._replay: dict[str, list[dict[str, Any]]] = {}
+
+    async def chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.4,  # accepted for interface parity; not sent
+        max_tokens: int = 256,
+    ) -> dict[str, Any]:
+        system, converted = self._convert_messages(messages, with_tools=bool(tools))
+        prewarm = max_tokens <= 1
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "max_tokens": 0 if prewarm else max(max_tokens, self.MIN_MAX_TOKENS),
+            "messages": converted,
+            "output_config": {"effort": self._effort},
+        }
+        if system:
+            # Breakpoint on the system block caches tools + system — the
+            # prefix every turn shares (the clock rides in the user turn).
+            kwargs["system"] = [{"type": "text", "text": system,
+                                 "cache_control": {"type": "ephemeral"}}]
+        if tools:
+            kwargs["tools"] = [self._convert_tool(t) for t in tools]
+        if not prewarm:
+            # Second breakpoint follows the conversation, so each tool-loop
+            # iteration re-reads the previous one's prefix from cache.
+            kwargs["cache_control"] = {"type": "ephemeral"}
+
+        a = self._anthropic
+        try:
+            resp = await self._sdk.messages.create(**kwargs)
+        except a.APIStatusError as exc:
+            raise LLMCallError(
+                f"answered HTTP {exc.status_code}: {exc.message}"[:400],
+                status=exc.status_code) from exc
+        except a.APITimeoutError as exc:  # a subclass of APIConnectionError
+            raise LLMCallError("timed out") from exc
+        except a.APIConnectionError as exc:
+            raise LLMCallError(f"unreachable ({exc.__class__.__name__})") from exc
+        return {"message": self._convert_response(resp)}
+
+    # ── OpenAI shape → Messages API ────────────────────────────────
+
+    @staticmethod
+    def _convert_tool(tool: dict[str, Any]) -> dict[str, Any]:
+        fn = tool.get("function") or tool
+        return {
+            "name": fn["name"],
+            "description": fn.get("description") or "",
+            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+
+    @staticmethod
+    def _text_of(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):  # OpenAI content parts
+            return "".join(p.get("text", "") for p in content
+                           if isinstance(p, dict) and p.get("type") == "text")
+        return "" if content is None else str(content)
+
+    @staticmethod
+    def _args_of(call: dict[str, Any]) -> dict[str, Any]:
+        raw = (call.get("function") or {}).get("arguments")
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _convert_messages(
+        self, messages: list[dict[str, Any]], *, with_tools: bool,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        system_parts: list[str] = []
+        out: list[dict[str, Any]] = []
+        # Ids of the tool_use blocks in the latest assistant turn; a tool
+        # result answering anything else is flattened to text.
+        open_calls: set[str] = set()
+
+        def push(role: str, blocks: list[dict[str, Any]]) -> None:
+            # The API wants alternating turns, and all of one assistant
+            # turn's tool results in ONE user message — merge neighbours.
+            if out and out[-1]["role"] == role:
+                out[-1]["content"].extend(blocks)
+            else:
+                out.append({"role": role, "content": list(blocks)})
+
+        for msg in messages:
+            role = msg.get("role")
+            text = self._text_of(msg.get("content"))
+            if role == "system":
+                if not out:
+                    system_parts.append(text)
+                else:
+                    push("user", [{"type": "text", "text": f"[{text}]"}])
+            elif role == "assistant":
+                calls = msg.get("tool_calls") or []
+                raw = (self._replay.get(str(calls[0].get("id", "")))
+                       if calls and with_tools else None)
+                open_calls = set()
+                if raw is not None:
+                    push("assistant", [dict(b) for b in raw])
+                    open_calls = {b["id"] for b in raw if b.get("type") == "tool_use"}
+                elif calls:
+                    named = ", ".join(
+                        f"{(c.get('function') or {}).get('name', '')}"
+                        f"({json.dumps(self._args_of(c), sort_keys=True)})" for c in calls)
+                    push("assistant", [{"type": "text",
+                                        "text": (text + "\n" if text.strip() else "")
+                                        + f"[I called {named}]"}])
+                elif text.strip():
+                    push("assistant", [{"type": "text", "text": text}])
+            elif role == "tool":
+                if str(msg.get("tool_call_id", "")) in open_calls:
+                    push("user", [{"type": "tool_result",
+                                   "tool_use_id": str(msg.get("tool_call_id", "")),
+                                   "content": text or "(no output)"}])
+                else:
+                    name = msg.get("name") or "tool"
+                    push("user", [{"type": "text",
+                                   "text": f"[{name} result]\n{text or '(no output)'}"}])
+            elif text.strip():
+                open_calls = set()
+                push("user", [{"type": "text", "text": text}])
+
+        if not out or out[0]["role"] != "user":
+            out.insert(0, {"role": "user", "content": [{"type": "text", "text": "(start)"}]})
+        return "\n\n".join(p for p in system_parts if p.strip()), out
+
+    # ── Messages API → OpenAI shape ────────────────────────────────
+
+    def _convert_response(self, resp: Any) -> dict[str, Any]:
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for block in resp.content or []:
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id, "type": "function",
+                    "function": {"name": block.name,
+                                 "arguments": json.dumps(block.input or {})},
+                })
+        if resp.stop_reason == "refusal":
+            logger.warning("anthropic: model declined the turn (stop_details=%s)",
+                           getattr(resp, "stop_details", None))
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            self._replay[tool_calls[0]["id"]] = [
+                b.model_dump(mode="json", exclude_none=True) for b in resp.content]
+            while len(self._replay) > self._REPLAY_CAP:
+                self._replay.pop(next(iter(self._replay)))
+        return message
+
+    async def aclose(self) -> None:
+        await self._sdk.close()
 
 
 class PiperClient(_ReusableClientMixin):

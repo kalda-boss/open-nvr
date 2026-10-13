@@ -1438,11 +1438,22 @@ services:
         set -e
         sed_esc() { printf '%s' "$$1" | sed -e 's/\\/\\\\/g; s/&/\\&/g; s/\//\\\//g'; }
         ikey=$$(sed_esc "$${INTERNAL_API_KEY}")
+        lprov=$$(sed_esc "$${LLM_PROVIDER}")
+        lmodel=$$(sed_esc "$${LLM_MODEL}")
+        leffort=$$(sed_esc "$${LLM_EFFORT}")
         sed -e "s/[$$][{]INTERNAL_API_KEY[}]/$$ikey/g" \
+            -e "s/[$$][{]LLM_PROVIDER[}]/$$lprov/g" \
+            -e "s/[$$][{]LLM_MODEL[}]/$$lmodel/g" \
+            -e "s/[$$][{]LLM_EFFORT[}]/$$leffort/g" \
             < /template/config.docker.yml > /generated/config.yml
         echo "Wrote /generated/config.yml (footage-search) from template."
     environment:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      # LLM_PROVIDER=anthropic parses search sentences with Claude. Blank
+      # model/effort take the app's defaults (claude-haiku-5-5, low).
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_EFFORT=${LLM_EFFORT:-}
     volumes:
       - ./examples/footage-search:/template:ro
       - opennvr_footage_search_config:/generated
@@ -1487,6 +1498,10 @@ services:
       - HTTP_PROXY=${APPS_EGRESS_PROXY_URL-http://egress-proxy:3128}
       - HTTPS_PROXY=${APPS_EGRESS_PROXY_URL-http://egress-proxy:3128}
       - NO_PROXY=opennvr-core,nats,nats-apps,egress-proxy,mediamtx,detect-pipeline,ollama,localhost,127.0.0.1
+      # LLM_PROVIDER=anthropic: the Claude query parser's key. Reaches
+      # api.anthropic.com through the proxy above, so allow that host on
+      # the app's card (App Catalog → Footage Search → egress).
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     expose:
       - "9208"
     volumes:
