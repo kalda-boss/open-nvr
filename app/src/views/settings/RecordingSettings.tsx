@@ -78,11 +78,16 @@ export function RecordingSettings() {
     const [retentionDays, setRetentionDays] = useState(30)
     const [protectFlagged, setProtectFlagged] = useState(true)
     const [minFreeSpace, setMinFreeSpace] = useState<number | ''>('')
+    const [maxStorage, setMaxStorage] = useState<number | ''>('')
     const [purgeOrphaned, setPurgeOrphaned] = useState(false)
 
     // Disk usage of the effective recordings volume (absent on older
     // backends or stat failure — the gauge is simply hidden then).
     const [diskInfo, setDiskInfo] = useState<{ total: number; used: number; free: number } | null>(null)
+    // Why the backend withheld the disk numbers (reading can't be the real disk).
+    const [diskUnreliable, setDiskUnreliable] = useState<string | null>(null)
+    // Total size of indexed recordings — what the storage cap measures.
+    const [indexedBytes, setIndexedBytes] = useState<number | null>(null)
 
     // Orphaned (quarantined) recording trees — superuser only; the card is
     // hidden entirely when the list is empty or the API refuses access.
@@ -111,12 +116,15 @@ export function RecordingSettings() {
                     ? { total: s.disk_total, used: s.disk_used, free: s.disk_free }
                     : null
             )
+            setDiskUnreliable(s.disk_unreliable ?? null)
+            setIndexedBytes(s.indexed_bytes ?? null)
 
             // Load retention settings
             const retention = retentionRes.data
             setRetentionDays(retention.retention_days ?? 30)
             setProtectFlagged(retention.protect_flagged ?? true)
             setMinFreeSpace(retention.min_free_space_gb ?? '')
+            setMaxStorage(retention.max_storage_gb ?? '')
             setPurgeOrphaned(retention.purge_orphaned_under_pressure ?? false)
         } catch (e: any) {
             showError(e?.message || 'Failed to load recording settings')
@@ -232,6 +240,7 @@ export function RecordingSettings() {
                 retention_days: retentionDays,
                 protect_flagged: protectFlagged,
                 min_free_space_gb: minFreeSpace === '' ? null : minFreeSpace,
+                max_storage_gb: maxStorage === '' ? null : maxStorage,
                 purge_orphaned_under_pressure: purgeOrphaned
             }
             await apiService.updateRecordingRetention(payload)
@@ -302,6 +311,14 @@ export function RecordingSettings() {
                                 />
                             </div>
                         )}
+
+                        {diskUnreliable && (
+                            <p className="text-xs text-[var(--text-dim)]">
+                                <strong>Disk usage unavailable:</strong> the volume's {diskUnreliable}, so its
+                                free-space reading can't be trusted (common with drives over 16 TiB in Docker
+                                Desktop on macOS). Minimum Free Space is ignored; use a Storage Cap instead.
+                            </p>
+                        )}
                     </div>
                 </div>
 
@@ -363,6 +380,43 @@ export function RecordingSettings() {
                         <p className="text-xs text-[var(--text-dim)] ml-7">
                             When enabled, flagged or bookmarked recordings will never be deleted automatically.
                         </p>
+
+                        {/* Storage Cap */}
+                        <div>
+                            <label className="block text-sm font-medium mb-1">Storage Cap (GB)</label>
+                            <input
+                                type="number"
+                                min={1}
+                                max={1000000}
+                                value={maxStorage}
+                                onChange={(e) => setMaxStorage(e.target.value === '' ? '' : parseInt(e.target.value))}
+                                className="w-full px-3 py-2 bg-[var(--bg-2)] border border-[var(--border)] focus:border-[var(--accent)] focus:outline-none"
+                                placeholder="Leave empty to disable"
+                            />
+                            {indexedBytes != null && (
+                                <div className="mt-2">
+                                    <div className="flex items-baseline justify-between text-xs mb-1">
+                                        <span className="text-[var(--text-dim)]">Recordings stored</span>
+                                        <span className="text-[var(--text-dim)]">
+                                            {formatBytes(indexedBytes)}
+                                            {maxStorage !== '' && maxStorage > 0 && (
+                                                <> of {formatBytes(maxStorage * 1024 ** 3)} cap ({Math.round((indexedBytes / (maxStorage * 1024 ** 3)) * 100)}%)</>
+                                            )}
+                                        </span>
+                                    </div>
+                                    {/* Never warn-coloured: sitting at the cap is the steady state. */}
+                                    {maxStorage !== '' && maxStorage > 0 && (
+                                        <UsageBar used={indexedBytes} total={maxStorage * 1024 ** 3} warnAt={1.01} critAt={1.01} />
+                                    )}
+                                </div>
+                            )}
+                            <p className="text-xs text-[var(--text-dim)] mt-1">
+                                When recordings take up more than this, the oldest are deleted until they fit (footage
+                                from the last 24 hours is never deleted this way). Measured from the recordings
+                                themselves, not the disk's free-space reading. Leave headroom for snapshots and other
+                                files on the drive. Leave empty to disable.
+                            </p>
+                        </div>
 
                         {/* Minimum Free Space */}
                         <div>

@@ -87,7 +87,7 @@ const ConnectionContext = createContext<boolean>(true)
 const REFRESH_COALESCE_MS = 750
 
 // Alert types that flip the persistent disk banner rather than just toasting.
-const DISK_CRITICAL_TYPES = new Set(['disk_low', 'disk_purge_exhausted'])
+const DISK_CRITICAL_TYPES = new Set(['disk_low', 'disk_purge_exhausted', 'storage_cap_exhausted'])
 // Re-toasting the same still-active alert type is suppressed for this long
 // (a WS reconnect or a re-published purge event must not spam the operator).
 const TOAST_COOLDOWN_MS = 10 * 60 * 1000

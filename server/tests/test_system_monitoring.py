@@ -204,7 +204,7 @@ def test_cleanup_by_space_no_progress_guard(db, tmp_path, monkeypatch):
             Recording(
                 filename=f"f{i}.mp4",
                 file_path=f"cam-1/{i}.mp4",  # never exists on disk
-                start_time=now - timedelta(minutes=1200 - i),
+                start_time=now - timedelta(days=2, minutes=1200 - i),
                 camera_id=1,
             )
         )
@@ -235,6 +235,8 @@ def test_cleanup_by_space_purges_fs_orphans_when_index_empty(db, tmp_path, monke
     cam_dir.mkdir(parents=True)
     orphan = cam_dir / "00-00-000000.mp4"
     orphan.write_bytes(b"x" * 1024)
+    old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
+    os.utime(orphan, (old, old))  # past the space purge's 24 h floor
 
     calls = {"n": 0}
 
