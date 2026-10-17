@@ -10,6 +10,8 @@ license = { text = "AGPL-3.0" }
 # the optional Ollama query parser also rides). No database of its
 # own any more — see the README.
 dependencies = [
+    # The optional Claude query parser (llm_provider: anthropic).
+    "anthropic>=1.0,<2",
     "opennvr-app-sdk",
 ]
 

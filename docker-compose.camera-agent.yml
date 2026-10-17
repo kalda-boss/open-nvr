@@ -489,12 +489,18 @@ services:
         ourl=$$(sed_esc "$${OLLAMA_URL}")
         cadapter=$$(sed_esc "$${CAPTION_ADAPTER}")
         ouiurl=$$(sed_esc "$${OPENNVR_UI_URL}")
+        lprov=$$(sed_esc "$${LLM_PROVIDER}")
+        lmodel=$$(sed_esc "$${LLM_MODEL}")
+        leffort=$$(sed_esc "$${LLM_EFFORT}")
         sed -e "s/[$$][{]INTERNAL_API_KEY[}]/$$ikey/g" \
             -e "s/[$$][{]CAMERA_AGENT_LISTEN_HOST[}]/$$lhost/g" \
             -e "s/[$$][{]OLLAMA_MODEL[}]/$$omodel/g" \
             -e "s/[$$][{]OLLAMA_URL[}]/$$ourl/g" \
             -e "s/[$$][{]CAPTION_ADAPTER[}]/$$cadapter/g" \
             -e "s/[$$][{]OPENNVR_UI_URL[}]/$$ouiurl/g" \
+            -e "s/[$$][{]LLM_PROVIDER[}]/$$lprov/g" \
+            -e "s/[$$][{]LLM_MODEL[}]/$$lmodel/g" \
+            -e "s/[$$][{]LLM_EFFORT[}]/$$leffort/g" \
             < /template/config.docker.yml > /generated/config.yml
         echo "Wrote /generated/config.yml (voice) from template."
     environment:
@@ -514,6 +520,13 @@ services:
       # "install the <App> app" deep-links. Override for LAN/remote installs,
       # e.g. OPENNVR_UI_URL=https://nvr.example in .env.
       - OPENNVR_UI_URL=${OPENNVR_UI_URL:-http://localhost:8000}
+      # The agent's brain. LLM_PROVIDER=anthropic runs it on Claude (start
+      # with docker-compose.anthropic.yml — ./start.sh adds it by itself);
+      # LLM_MODEL then names a Claude model and LLM_EFFORT its thinking
+      # depth. Unset = the local Ollama model above.
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_MODEL=${LLM_MODEL:-${OLLAMA_MODEL:-qwen2.5:1.5b}}
+      - LLM_EFFORT=${LLM_EFFORT:-low}
     volumes:
       - ./examples/camera-agent:/template:ro
       - opennvr_camera_agent_config:/generated
@@ -559,6 +572,8 @@ services:
       - TZ=${TZ:-UTC}
       # The Piper voice the agent asks for (see piper-voices-init).
       - PIPER_VOICE=${PIPER_VOICE:-en_US-lessac-medium}
+      # Read by the Anthropic SDK when LLM_PROVIDER=anthropic; empty otherwise.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     volumes:
       - opennvr_camera_agent_config:/app/config:ro
       - ./agent-certs/camera-agent:/certs:ro
@@ -590,12 +605,18 @@ services:
         ourl=$$(sed_esc "$${OLLAMA_URL}")
         cadapter=$$(sed_esc "$${CAPTION_ADAPTER}")
         ouiurl=$$(sed_esc "$${OPENNVR_UI_URL}")
+        lprov=$$(sed_esc "$${LLM_PROVIDER}")
+        lmodel=$$(sed_esc "$${LLM_MODEL}")
+        leffort=$$(sed_esc "$${LLM_EFFORT}")
         sed -e "s/[$$][{]INTERNAL_API_KEY[}]/$$ikey/g" \
             -e "s/[$$][{]CAMERA_AGENT_LISTEN_HOST[}]/$$lhost/g" \
             -e "s/[$$][{]OLLAMA_MODEL[}]/$$omodel/g" \
             -e "s/[$$][{]OLLAMA_URL[}]/$$ourl/g" \
             -e "s/[$$][{]CAPTION_ADAPTER[}]/$$cadapter/g" \
             -e "s/[$$][{]OPENNVR_UI_URL[}]/$$ouiurl/g" \
+            -e "s/[$$][{]LLM_PROVIDER[}]/$$lprov/g" \
+            -e "s/[$$][{]LLM_MODEL[}]/$$lmodel/g" \
+            -e "s/[$$][{]LLM_EFFORT[}]/$$leffort/g" \
             < /template/config.docker.chat.yml > /generated/config.yml
         echo "Wrote /generated/config.yml (chat) from template."
     environment:
@@ -611,6 +632,13 @@ services:
       # "install the <App> app" deep-links. Override for LAN/remote installs,
       # e.g. OPENNVR_UI_URL=https://nvr.example in .env.
       - OPENNVR_UI_URL=${OPENNVR_UI_URL:-http://localhost:8000}
+      # The agent's brain. LLM_PROVIDER=anthropic runs it on Claude (start
+      # with docker-compose.anthropic.yml — ./start.sh adds it by itself);
+      # LLM_MODEL then names a Claude model and LLM_EFFORT its thinking
+      # depth. Unset = the local Ollama model above.
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_MODEL=${LLM_MODEL:-${OLLAMA_MODEL:-qwen2.5:1.5b}}
+      - LLM_EFFORT=${LLM_EFFORT:-low}
     volumes:
       - ./examples/camera-agent:/template:ro
       - opennvr_camera_agent_config_chat:/generated
@@ -648,6 +676,7 @@ services:
     environment:
       # Same rule as the voice agent: time windows tick in the site's zone.
       - TZ=${TZ:-UTC}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     volumes:
       - opennvr_camera_agent_config_chat:/app/config:ro
       - ./agent-certs/camera-agent:/certs:ro

@@ -20,7 +20,10 @@ kaic_api_key: ${INTERNAL_API_KEY}
 
 ollama_url: ${OLLAMA_URL}
 ollama_token:
-llm_model: ${OLLAMA_MODEL}
+# See config.docker.yml: LLM_PROVIDER ollama | anthropic, LLM_MODEL, LLM_EFFORT.
+llm_provider: ${LLM_PROVIDER}
+llm_effort: ${LLM_EFFORT}
+llm_model: ${LLM_MODEL}
 llm_think: false   # Qwen3 default: snappy non-thinking tool-calling
 llm_temperature: 0.3
 llm_max_tokens: 220

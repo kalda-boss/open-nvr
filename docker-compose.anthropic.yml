@@ -1,0 +1,91 @@
+# Copyright (c) 2026 OpenNVR
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Claude overlay for the camera-agent profiles: every model call goes to
+# the Anthropic API instead of a local runtime.
+#
+#   * the agent's brain (voice and chat) → LLM_MODEL, via the Anthropic SDK
+#   * the caption/VQA slot → the claudevlm adapter (adapters/claudevlm),
+#     which serves describe_camera, core's caption and descriptor
+#     enrichment, scene descriptions and package-delivery's parcel count
+#   * the bundled ollama container is not started at all
+#
+# Footage search needs no overlay: LLM_PROVIDER reaches it through
+# docker-compose.apps.yml (allow api.anthropic.com on its catalog card).
+#
+# Usage: in .env
+#     LLM_PROVIDER=anthropic
+#     ANTHROPIC_API_KEY=sk-ant-...
+#     LLM_MODEL=claude-haiku-5-5      # optional; the default here
+#     LLM_EFFORT=low                  # optional; low | medium | high | ...
+#     AI_SOVEREIGNTY=federated        # KAI-C refuses a cloud adapter under local_only
+# and ./start.sh adds this file by itself whenever a camera-agent profile
+# is configured. Frames and chat text leave the machine for
+# api.anthropic.com; nothing else does.
+
+services:
+  # Parked, as in docker-compose.camera-agent.external-llm.yml: compose has
+  # no "remove service" in an overlay, so an inert profile is the idiom.
+  # ``!override`` because profile lists merge by UNION otherwise.
+  ollama:
+    profiles: !override ["anthropic-inert"]
+  ollama-model-pull:
+    profiles: !override ["anthropic-inert"]
+
+  camera-agent-config-init:
+    environment:
+      - CAPTION_ADAPTER=claudevlm
+      - LLM_MODEL=${LLM_MODEL:-claude-haiku-5-5}
+  camera-agent-config-init-chat:
+    environment:
+      - CAPTION_ADAPTER=claudevlm
+      - LLM_MODEL=${LLM_MODEL:-claude-haiku-5-5}
+
+  camera-agent:
+    # The published image predates the Claude provider: build this
+    # checkout's agent instead (the chat variant already does).
+    build:
+      context: .
+      dockerfile: examples/camera-agent/Dockerfile
+    image: opennvr/camera-agent:local-build
+    pull_policy: ${APPS_PULL_POLICY:-build}
+    depends_on: !override
+      camera-agent-config-init:
+        condition: service_completed_successfully
+      camera-agent-certs-init:
+        condition: service_completed_successfully
+      whisper-adapter:
+        condition: service_healthy
+      piper-adapter:
+        condition: service_healthy
+      caption-adapter:
+        condition: service_healthy
+      opennvr-core:
+        condition: service_healthy
+
+  camera-agent-chat:
+    depends_on: !override
+      camera-agent-config-init-chat:
+        condition: service_completed_successfully
+      camera-agent-certs-init:
+        condition: service_completed_successfully
+      caption-adapter:
+        condition: service_healthy
+      opennvr-core:
+        condition: service_healthy
+
+  caption-adapter:
+    build:
+      context: .
+      dockerfile: adapters/claudevlm/Dockerfile
+    image: opennvr/claudevlm-adapter:local-build
+    pull_policy: ${APPS_PULL_POLICY:-build}
+    command: !override ["uvicorn", "adapters.claudevlm.main:app", "--host", "0.0.0.0", "--port", "9006"]
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENNVR_CLAUDE_VLM_MODEL=${LLM_MODEL:-claude-haiku-5-5}
+      - OPENNVR_CLAUDE_VLM_EFFORT=${LLM_EFFORT:-low}
+
+  caption-adapter-register:
+    environment:
+      - CAPTION_ADAPTER=claudevlm

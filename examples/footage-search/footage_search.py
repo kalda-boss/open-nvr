@@ -73,7 +73,7 @@ from opennvr_app_sdk import Action, AppManifest, ContractApp, Param, StateView
 from opennvr_app_sdk.client import OpenNVR
 from opennvr_app_sdk.config import load_yaml
 
-from query import DEFAULT_LABELS, parse_heuristic, parse_with_ollama
+from query import DEFAULT_LABELS, parse_heuristic, parse_with_anthropic, parse_with_ollama
 
 logger = logging.getLogger("footage-search")
 
@@ -139,10 +139,20 @@ class OllamaConfig:
 
 
 @dataclass
+class AnthropicConfig:
+    model: str = "claude-haiku-5-5"
+    effort: str = "low"
+
+
+@dataclass
 class AppConfig:
     extra_labels: list[str] = field(default_factory=list)
     camera_aliases: dict[str, str] = field(default_factory=dict)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    # "anthropic" parses queries with Claude (and ignores ``ollama``);
+    # anything else keeps the ``ollama`` section's choice.
+    llm_provider: str = ""
+    anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
     result_limit: int = 25
 
     # App contract (spec §03). ``contract_port`` serves /health
@@ -174,6 +184,11 @@ def load_config(path: str) -> AppConfig:
         url=str(ollama_raw.get("url", "http://ollama:11434")),
         model=str(ollama_raw.get("model", "llama3.2")),
     )
+    anthropic_raw = raw.get("anthropic") or {}
+    anthropic = AnthropicConfig(
+        model=str(anthropic_raw.get("model") or "claude-haiku-5-5"),
+        effort=str(anthropic_raw.get("effort") or "low"),
+    )
 
     try:
         result_limit = int(raw.get("result_limit", 25))
@@ -193,6 +208,8 @@ def load_config(path: str) -> AppConfig:
         extra_labels=extra_labels,
         camera_aliases=camera_aliases,
         ollama=ollama,
+        llm_provider=str(raw.get("llm_provider") or "").strip().lower(),
+        anthropic=anthropic,
         result_limit=result_limit,
         contract_port=(
             int(contract_port_raw) if contract_port_raw is not None else None
@@ -276,7 +293,13 @@ def run_search(config: AppConfig, client: OpenNVR, query: str,
     """Parse the query and run it against the canonical store."""
     now = _dt.datetime.now(_dt.timezone.utc)
     vocab = set(DEFAULT_LABELS) | set(config.extra_labels)
-    if config.ollama.enabled:
+    if config.llm_provider == "anthropic":
+        qf = parse_with_anthropic(
+            query, now=now, model=config.anthropic.model,
+            effort=config.anthropic.effort, label_vocab=vocab,
+            camera_aliases=config.camera_aliases,
+        )
+    elif config.ollama.enabled:
         qf = parse_with_ollama(
             query, now=now, ollama_url=config.ollama.url,
             model=config.ollama.model, label_vocab=vocab,

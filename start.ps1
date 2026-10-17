@@ -66,9 +66,18 @@ function Get-ComposeArgs {
         # the bundled ollama container and points the agent at the operator's
         # endpoint — the GPU path on macOS/Windows, where the in-VM container
         # is CPU-only. Mirrors compose_args in start.sh.
+        # Claude (LLM_PROVIDER=anthropic) replaces it: no LLM runtime at all.
         $externalLlm = Get-EnvVar "OLLAMA_EXTERNAL_URL"
-        if ($externalLlm -and $exampleCompose -like "*camera-agent.yml*") {
-            $args += @("-f", "docker-compose.camera-agent.external-llm.yml")
+        # Last line wins, as in compose's own .env parsing (Get-EnvVar takes the first).
+        $llmProvider = ([IO.File]::ReadAllLines((Resolve-Path ".env"), (New-Object Text.UTF8Encoding($false))) |
+            Where-Object { $_ -match "^LLM_PROVIDER=" } | Select-Object -Last 1) -replace '^LLM_PROVIDER=', '' -replace '["'']', ''
+
+        if ($exampleCompose -like "*camera-agent.yml*") {
+            if (($llmProvider -replace '\s*#.*$', '').Trim() -eq "anthropic") {
+                $args += @("-f", "docker-compose.anthropic.yml")
+            } elseif ($externalLlm) {
+                $args += @("-f", "docker-compose.camera-agent.external-llm.yml")
+            }
         }
     }
     foreach ($p in @($exampleProfile -split "," | Where-Object { $_ })) { $args += @("--profile", $p) }
