@@ -50,6 +50,53 @@ class StorageConfig:
     active_mount_path: str | None = None
 
 
+def indexed_recordings_bytes(db: Session) -> int:
+    """Total size of all indexed recordings (SUM of Recording.file_size)."""
+    from sqlalchemy import func
+
+    from models import Recording
+
+    total = db.query(func.coalesce(func.sum(Recording.file_size), 0)).scalar()
+    return int(total or 0)
+
+
+def disk_reading_problem(
+    total: int,
+    used: int,
+    indexed_bytes: int,
+    cap_gb: float | None,
+    min_free_gb: float | None = None,
+) -> str | None:
+    """Why a ``shutil.disk_usage`` reading can't be the real recordings disk,
+    or None if it's plausible.
+
+    macOS ``statvfs`` keeps block counts in 32 bits, so a volume over 16 TiB
+    wraps — and Docker Desktop's virtiofs passes the wrapped numbers into the
+    container (an 18 TB drive reads as ~408 GB). Purging or alerting on such
+    a reading deletes footage the disk has plenty of room for.
+    """
+    gb = 1024**3
+    if used < 0:
+        return f"used space is negative ({used / gb:.1f} GB)"
+    if indexed_bytes > total:
+        return (
+            f"reported size {total / gb:.1f} GB is smaller than the "
+            f"{indexed_bytes / gb:.1f} GB of indexed recordings"
+        )
+    if cap_gb and total < cap_gb * gb:
+        return (
+            f"reported size {total / gb:.1f} GB is smaller than the "
+            f"{cap_gb:g} GB storage cap"
+        )
+    if min_free_gb and total < min_free_gb * gb:
+        # A floor the whole disk can't satisfy would purge everything.
+        return (
+            f"reported size {total / gb:.1f} GB is smaller than the "
+            f"{min_free_gb:g} GB minimum-free-space floor"
+        )
+    return None
+
+
 def _load_storage_config(db: Session) -> StorageConfig:
     """Load storage configuration from database."""
     row: SecuritySetting | None = (
@@ -385,18 +432,45 @@ class StorageService:
         # platform; the old os.statvfs branch unpacked a 10-field struct into
         # 3 names, raised on Linux, and the error was swallowed — so disk
         # usage was silently never reported there.
+        indexed = None
+        retention: dict[str, Any] = {}
+        try:
+            from services.retention_service import RetentionService
+
+            indexed = indexed_recordings_bytes(db)
+            retention = RetentionService._get_retention_settings(db)
+            info["indexed_bytes"] = indexed
+        except Exception as e:
+            storage_logger.warning(f"Indexed recordings size unavailable: {e}")
+
         try:
             if root.exists():
                 import shutil
 
                 total, used, free = shutil.disk_usage(str(root))
-                info.update(
-                    {
-                        "disk_total": total,
-                        "disk_used": used,
-                        "disk_free": free,
-                    }
+                problem = (
+                    disk_reading_problem(
+                        total,
+                        used,
+                        indexed,
+                        retention.get("max_storage_gb"),
+                        retention.get("min_free_space_gb"),
+                    )
+                    if indexed is not None
+                    else None
                 )
+                if problem:
+                    # Withhold numbers that can't be the real disk rather
+                    # than draw a confidently wrong gauge.
+                    info["disk_unreliable"] = problem
+                else:
+                    info.update(
+                        {
+                            "disk_total": total,
+                            "disk_used": used,
+                            "disk_free": free,
+                        }
+                    )
         except Exception as e:
             info["disk_error"] = str(e)
 

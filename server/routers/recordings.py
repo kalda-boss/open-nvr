@@ -492,7 +492,13 @@ async def get_storage(
     # capacity gauge next to the path (fields absent on stat failure).
     try:
         info = storage_service.get_storage_info(db)
-        for key in ("disk_total", "disk_used", "disk_free"):
+        for key in (
+            "disk_total",
+            "disk_used",
+            "disk_free",
+            "disk_unreliable",
+            "indexed_bytes",
+        ):
             if key in info:
                 result[key] = info[key]
     except Exception:

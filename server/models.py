@@ -810,7 +810,8 @@ class SystemEvent(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     # cpu_high | memory_high | disk_low | disk_pressure_purge |
-    # disk_purge_exhausted | disk_stat_error
+    # disk_purge_exhausted | disk_stat_error | storage_cap_purge |
+    # storage_cap_exhausted
     event_type = Column(String(50), nullable=False)
     event_state = Column(String(20), nullable=True)  # active | inactive | None
     severity = Column(String(10), nullable=False, default="warning")

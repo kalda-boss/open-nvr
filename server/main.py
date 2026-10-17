@@ -496,8 +496,9 @@ async def lifespan(app: FastAPI):
 
     # Disk-pressure loop: a near-full disk cannot wait for the daily sweep —
     # MediaMTX simply fails to write once space runs out. Every 5 minutes:
-    # one cheap disk_usage check, and only when below min_free_space_gb an
-    # oldest-first batched purge (with hysteresis) in a worker thread.
+    # a cheap storage-cap SUM and/or disk_usage check, and only when over
+    # max_storage_gb / below min_free_space_gb an oldest-first batched purge
+    # (with hysteresis) in a worker thread.
     async def background_disk_pressure():
         try:
             from services.event_bus_service import publish_system_alert

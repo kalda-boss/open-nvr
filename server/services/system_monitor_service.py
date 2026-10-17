@@ -40,7 +40,11 @@ from core.database import SessionLocal
 from core.logging_config import main_logger
 from models import SecuritySetting
 from schemas import SystemMonitoringSettings
-from services.storage_service import get_effective_recordings_base_path
+from services.storage_service import (
+    disk_reading_problem,
+    get_effective_recordings_base_path,
+    indexed_recordings_bytes,
+)
 from services.system_events import latest_event_state, record_system_event
 
 try:  # degrade to disk-only metrics on stripped deployments
@@ -57,6 +61,10 @@ STARTUP_DELAY_SECONDS = 30
 _FINE_MAXLEN = 240
 _COARSE_MAXLEN = 288
 _COARSE_EVERY = 20  # fine samples per coarse point (20 * 15s = 5 min)
+
+# The disk plausibility check sums the recordings index; refresh that (and
+# the storage cap it's compared with) at most this often, not every sample.
+_INDEX_SIZE_TTL_SECONDS = 300
 
 ALERT_CPU_HIGH = "cpu_high"
 ALERT_MEMORY_HIGH = "memory_high"
@@ -98,6 +106,8 @@ class SystemMonitorService:
         self._active: dict[str, bool] | None = None
         self._active_info: dict[str, dict[str, Any]] = {}
         self._last_notified: dict[str, float] = {}
+        # (fetched_at, indexed_bytes, retention settings) for the disk check.
+        self._index_size: tuple[float, int, dict[str, Any]] | None = None
 
     # ------------------------------------------------------------------ sample
 
@@ -113,6 +123,9 @@ class SystemMonitorService:
             "memory": None,
             "disk": None,
             "disk_error": None,
+            # Set (with "disk" left None) when the reading can't be the real
+            # disk, e.g. a >16 TiB volume through Docker Desktop on macOS.
+            "disk_unreliable": None,
             # No GPU probe yet; the key is part of the API contract (HA-105)
             # so clients can rely on it and read null as "unknown".
             "gpu": None,
@@ -138,6 +151,10 @@ class SystemMonitorService:
         try:
             base_path = get_effective_recordings_base_path(db)
             stat = shutil.disk_usage(base_path)
+            problem = self._disk_problem(db, stat.total, stat.used)
+            if problem:
+                out["disk_unreliable"] = problem
+                return out
             out["disk"] = {
                 "path": base_path,
                 "total": stat.total,
@@ -150,6 +167,31 @@ class SystemMonitorService:
         except Exception as e:
             out["disk_error"] = str(e)
         return out
+
+    def _disk_problem(self, db: Session, total: int, used: int) -> str | None:
+        """Plausibility check on a disk reading (see disk_reading_problem).
+        Best-effort: an index/settings failure never hides a reading."""
+        try:
+            now = datetime.now(UTC).timestamp()
+            if (
+                self._index_size is None
+                or now - self._index_size[0] >= _INDEX_SIZE_TTL_SECONDS
+            ):
+                from services.retention_service import RetentionService
+
+                retention = RetentionService._get_retention_settings(db)
+                self._index_size = (now, indexed_recordings_bytes(db), retention)
+            _, indexed, retention = self._index_size
+            return disk_reading_problem(
+                total,
+                used,
+                indexed,
+                retention.get("max_storage_gb"),
+                retention.get("min_free_space_gb"),
+            )
+        except Exception as e:
+            main_logger.warning(f"Disk plausibility check failed: {e}")
+            return None
 
     # ----------------------------------------------------------------- history
 
@@ -325,13 +367,14 @@ class SystemMonitorService:
 
         disk = sample.get("disk")
         disk_error = sample.get("disk_error")
+        disk_unreliable = sample.get("disk_unreliable")
         # Disk stat failure is its own alert: with no reading, neither the
         # monitor nor the retention purge can protect the volume (fail-safe
         # replaces the old silent float("inf") fail-open).
         self._edge(
             alert_type=ALERT_DISK_STAT_ERROR,
             breach=disk is None and disk_error is not None,
-            clear=disk is not None,
+            clear=disk is not None or disk_unreliable is not None,
             sustained_seconds=SAMPLE_INTERVAL_SECONDS,  # 2 consecutive samples
             now_ts=now_ts,
             severity="warning",
@@ -376,6 +419,20 @@ class SystemMonitorService:
                     },
                     transitions=transitions,
                 )
+        elif disk_unreliable is not None:
+            # No trustworthy numbers: resolve a disk_low raised from bad
+            # ones rather than leave it latched.
+            self._edge(
+                alert_type=ALERT_DISK_LOW,
+                breach=False,
+                clear=True,
+                sustained_seconds=SAMPLE_INTERVAL_SECONDS,
+                now_ts=now_ts,
+                severity="info",
+                description=f"Recordings disk low (reading unreliable: {disk_unreliable})",
+                data={"unreliable": disk_unreliable},
+                transitions=transitions,
+            )
         return transitions
 
     # --------------------------------------------------------------- main pass

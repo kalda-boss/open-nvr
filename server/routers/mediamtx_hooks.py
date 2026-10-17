@@ -277,12 +277,38 @@ async def hook_segment_complete(
     # one. Fail closed: on any error, skip indexing (the reconciler is the
     # authoritative pass and will converge).
     identity_ok = True
+    root: pathlib.Path | None = None
+    try:
+        from services.storage_service import get_effective_recordings_base_path
+
+        root = pathlib.Path(get_effective_recordings_base_path(db))
+    except Exception as e:
+        faststart_logger.error(f"Recordings root lookup failed: {e}")
+
+    # Convert absolute path to relative path
+    # MediaMTX sends: /app/recordings/cam-1/2026-02-26/07/03-24-036694.mp4
+    # We store:       cam-1/2026-02-26/07/03-24-036694.mp4
+    relative_path = segment_path
+    norm_path = segment_path.replace("\\", "/")
+    idx = norm_path.lower().find("/recordings/")
+    if idx >= 0:
+        relative_path = norm_path[idx + len("/recordings/"):]
+
+    # The file as THIS process sees it. MediaMTX's recordPath is relative to
+    # its own working dir ("./app/recordings/..." from "/"), so resolving it
+    # here against core's cwd ("/app") yields "/app/app/recordings/..." —
+    # a path that doesn't exist, which silently left file_size and codec
+    # NULL on every webhook row. Re-anchor on the recordings root instead.
+    local_file = segment_path
+    if root is not None and idx >= 0:
+        local_file = str(root / relative_path)
+
     if cam:
         try:
             from services.camera_identity import verify_segment_identity
-            from services.storage_service import get_effective_recordings_base_path
 
-            root = pathlib.Path(get_effective_recordings_base_path(db))
+            if root is None:
+                raise RuntimeError("recordings root unavailable")
             identity_ok = verify_segment_identity(cam, path, root)
         except Exception as e:
             faststart_logger.error(f"Identity check failed for path {path}: {e}")
@@ -304,7 +330,7 @@ async def hook_segment_complete(
             file_size = None
             mtime = None
             try:
-                st = os.stat(segment_path)
+                st = os.stat(local_file)
                 file_size = st.st_size
                 mtime = st.st_mtime
             except OSError:
@@ -317,7 +343,7 @@ async def hook_segment_complete(
             # and filesystem always agree.
             from services.recording_paths import parse_recording_time
 
-            start_time = parse_recording_time(segment_path, mtime=mtime)
+            start_time = parse_recording_time(local_file, mtime=mtime)
             if start_time is None:
                 # Unrecognized name: fall back to receipt-time minus duration.
                 start_time = datetime.now(UTC) - timedelta(seconds=duration_sec or 0)
@@ -329,18 +355,9 @@ async def hook_segment_complete(
             try:
                 from services.hevc_remux_service import probe_video_codec
 
-                codec = probe_video_codec(segment_path)
+                codec = probe_video_codec(local_file)
             except Exception:
                 pass
-
-            # Convert absolute path to relative path
-            # MediaMTX sends: /app/recordings/cam-1/2026-02-26/07/03-24-036694.mp4
-            # We store:       cam-1/2026-02-26/07/03-24-036694.mp4
-            relative_path = segment_path
-            norm_path = segment_path.replace("\\", "/")
-            idx = norm_path.lower().find("/recordings/")
-            if idx >= 0:
-                relative_path = norm_path[idx + len("/recordings/"):]
 
             # A wall-clock end can overshoot the next segment's open instant
             # by the part-flush lag (a second or two of mtime trailing the
@@ -386,7 +403,7 @@ async def hook_segment_complete(
             else:
                 recording = Recording(
                     camera_id=cam.id,
-                    filename=os.path.basename(segment_path),
+                    filename=os.path.basename(local_file),
                     file_path=relative_path,
                     file_size=file_size,
                     duration=duration_sec,
@@ -415,7 +432,7 @@ async def hook_segment_complete(
     try:
         from services.cloud_recording_service import CloudRecordingService
 
-        if segment_path and os.path.exists(segment_path) and identity_ok:
+        if local_file and os.path.exists(local_file) and identity_ok:
             # Build relative path under Recordings root
             def _extract_rel(full_path: str) -> str:
                 if not full_path:
@@ -426,18 +443,18 @@ async def hook_segment_complete(
                     return parts[1]
                 return os.path.basename(full_path)
 
-            rel = _extract_rel(segment_path)
+            rel = _extract_rel(local_file)
             camera_id = getattr(cam, "id", None) if cam else None
 
             # Queue upload for async processing (supports S3 and NVR-to-NVR with BYOK)
             cloud_service = CloudRecordingService.get_instance()
             background_tasks.add_task(
                 cloud_service.queue_upload,
-                segment_path,
+                local_file,
                 camera_id,
                 rel,
             )
-            faststart_logger.info(f"Queued cloud upload for: {segment_path}")
+            faststart_logger.info(f"Queued cloud upload for: {local_file}")
     except Exception as e:
         faststart_logger.warning(f"Cloud mirror step error: {e}")
 

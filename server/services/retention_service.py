@@ -33,7 +33,11 @@ from sqlalchemy.orm import Session
 from core.database import SessionLocal
 from core.logging_config import recording_logger
 from models import Recording, SecuritySetting
-from services.storage_service import get_effective_recordings_base_path
+from services.storage_service import (
+    disk_reading_problem,
+    get_effective_recordings_base_path,
+    indexed_recordings_bytes,
+)
 
 RETENTION_SETTINGS_KEY = "recordings_retention"
 
@@ -53,6 +57,7 @@ class RetentionService:
             "retention_days": 30,
             "protect_flagged": True,
             "min_free_space_gb": None,
+            "max_storage_gb": None,
             "purge_orphaned_under_pressure": False,
         }
         if not row or not row.json_value:
@@ -127,18 +132,20 @@ class RetentionService:
             retention_days = settings_dict.get("retention_days", 30)
             protect_flagged = settings_dict.get("protect_flagged", True)
             min_free_space_gb = settings_dict.get("min_free_space_gb")
+            max_storage_gb = settings_dict.get("max_storage_gb")
 
             recording_logger.info(
                 f"Starting retention cleanup: retention_days={retention_days}, "
-                f"protect_flagged={protect_flagged}, min_free_space_gb={min_free_space_gb}"
+                f"protect_flagged={protect_flagged}, min_free_space_gb={min_free_space_gb}, "
+                f"max_storage_gb={max_storage_gb}"
             )
 
             # Bounded-growth housekeeping (camera events, device registry,
             # remux cache) runs regardless of the recording retention policy.
             aux = RetentionService.cleanup_auxiliary(db, retention_days)
 
-            # If retention_days is 0, keep all recordings (unless min_free_space is triggered)
-            if retention_days == 0 and not min_free_space_gb:
+            # If retention_days is 0, keep all recordings (unless a space limit is set)
+            if retention_days == 0 and not min_free_space_gb and not max_storage_gb:
                 recording_logger.info(
                     "Retention policy: Keep all recordings indefinitely"
                 )
@@ -188,12 +195,33 @@ class RetentionService:
                 stats["deleted_files"] += stats_orphans["deleted_files"]
                 stats["freed_space_mb"] += stats_orphans["freed_space_mb"]
 
-            # Phase 2: Free space cleanup (if needed)
+            # Phase 2: Storage cap (if set). Works off the index alone.
+            if max_storage_gb:
+                stats_cap = RetentionService._cleanup_by_size_cap(
+                    db, base_path, max_storage_gb, protect_flagged
+                )
+                if stats_cap:
+                    stats["deleted_files"] += stats_cap["deleted_files"]
+                    stats["deleted_records"] += stats_cap["deleted_records"]
+                    stats["freed_space_mb"] += stats_cap["freed_space_mb"]
+
+            # Phase 3: Free space cleanup (if needed)
             if min_free_space_gb:
-                free_space_gb = RetentionService._get_disk_free_space_gb(str(base_path))
-                if free_space_gb is None:
+                problem = RetentionService._disk_reading_problem(
+                    db, base_path, settings_dict
+                )
+                free_space_gb = (
+                    None
+                    if problem
+                    else RetentionService._get_disk_free_space_gb(str(base_path))
+                )
+                if problem:
                     recording_logger.warning(
-                        "Phase 2 skipped: disk usage unavailable (fail-safe)"
+                        f"Phase 3 skipped: disk reading is implausible ({problem})"
+                    )
+                elif free_space_gb is None:
+                    recording_logger.warning(
+                        "Phase 3 skipped: disk usage unavailable (fail-safe)"
                     )
                 else:
                     recording_logger.info(
@@ -203,7 +231,7 @@ class RetentionService:
 
                     if free_space_gb < min_free_space_gb:
                         recording_logger.info(
-                            "Phase 2: Free space below threshold, deleting oldest recordings"
+                            "Phase 3: Free space below threshold, deleting oldest recordings"
                         )
                         stats_space = RetentionService._cleanup_by_space(
                             db,
@@ -449,8 +477,14 @@ class RetentionService:
     # run once per batch instead of once per file.
     DELETE_BATCH_SIZE = 500
     # Free-space hysteresis: once below the threshold, delete until we're this
-    # far ABOVE it, so the pressure loop doesn't thrash at the boundary.
+    # far ABOVE it, so the pressure loop doesn't thrash at the boundary. The
+    # storage cap uses the same margin below the cap.
     FREE_SPACE_HYSTERESIS_GB = 5.0
+    # Space-driven purges (free-space floor and storage cap) never delete
+    # footage younger than this. A bogus disk reading once made the
+    # free-space purge delete every clip within a minute of it being
+    # written; the age purge is unaffected (retention_days is explicit).
+    SPACE_PURGE_MIN_AGE = timedelta(hours=24)
 
     @staticmethod
     def _delete_rows_batch(
@@ -647,6 +681,7 @@ class RetentionService:
         """
         stats = {"deleted_files": 0, "deleted_records": 0, "freed_space_mb": 0}
         target_gb = min_free_space_gb + RetentionService.FREE_SPACE_HYSTERESIS_GB
+        floor = datetime.now(UTC) - RetentionService.SPACE_PURGE_MIN_AGE
         exhausted_reason: str | None = None
 
         for _ in range(RetentionService.MAX_SPACE_BATCHES):
@@ -658,7 +693,7 @@ class RetentionService:
                 RetentionService._set_purge_exhausted(False, free_gb, target_gb)
                 return stats
 
-            q = db.query(Recording)
+            q = db.query(Recording).filter(Recording.start_time < floor)
             if protect_flagged:
                 q = q.filter(Recording.is_flagged == False)  # noqa: E712
             rows = (
@@ -667,7 +702,7 @@ class RetentionService:
                 .all()
             )
             if not rows:
-                exhausted_reason = "no more deletable recordings"
+                exhausted_reason = "no deletable recordings older than 24 h left"
                 break
             files_before = stats["deleted_files"]
             RetentionService._delete_rows_batch(db, base_path, rows, stats)
@@ -752,7 +787,8 @@ class RetentionService:
 
         Order: filesystem-orphan clips in camera dirs (no DB row), then
         .evidence JPEGs, then — opt-in only — quarantined orphaned/ clips.
-        Each group is deleted oldest-first until the target clears.
+        Each group is deleted oldest-first until the target clears. Files
+        newer than ``SPACE_PURGE_MIN_AGE`` are never touched.
         """
         try:
             from services.camera_identity import ORPHANED_DIR_NAME
@@ -790,7 +826,12 @@ class RetentionService:
                     except OSError:
                         return 0.0
 
-                files.sort(key=mtime)
+                floor_ts = (
+                    datetime.now(UTC) - RetentionService.SPACE_PURGE_MIN_AGE
+                ).timestamp()
+                files = sorted(
+                    (f for f in files if mtime(f) < floor_ts), key=mtime
+                )
                 for i, f in enumerate(files):
                     # Re-check the target once per pseudo-batch, not per file.
                     if i % RetentionService.DELETE_BATCH_SIZE == 0:
@@ -830,6 +871,139 @@ class RetentionService:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _disk_reading_problem(
+        db: Session, base_path: Path, settings_dict: dict[str, Any]
+    ) -> str | None:
+        """Why the free-space reading can't be trusted, or None.
+
+        A stat failure is not a "problem" here — ``_get_disk_free_space_gb``
+        already fails safe on it.
+        """
+        try:
+            usage = shutil.disk_usage(str(base_path))
+            return disk_reading_problem(
+                usage.total,
+                usage.used,
+                indexed_recordings_bytes(db),
+                settings_dict.get("max_storage_gb"),
+                settings_dict.get("min_free_space_gb"),
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _cleanup_by_size_cap(
+        db: Session,
+        base_path: Path,
+        max_storage_gb: float,
+        protect_flagged: bool,
+    ) -> dict[str, Any] | None:
+        """Delete oldest recordings until the indexed total is under the cap.
+
+        Size comes from SUM(file_size) over the index, never the filesystem,
+        so a misreported disk can't trigger it. Returns None when already
+        under the cap. Deletes down to cap - hysteresis, oldest-first, never
+        touching footage newer than ``SPACE_PURGE_MIN_AGE``. Still over the
+        cap after the pass -> critical ``storage_cap_exhausted`` event.
+        """
+        gb = 1024**3
+        cap_bytes = max_storage_gb * gb
+        used = indexed_recordings_bytes(db)
+        if used <= cap_bytes:
+            RetentionService._set_cap_exhausted(False, used, cap_bytes)
+            return None
+
+        recording_logger.warning(
+            f"Storage cap: {used / gb:.1f} GB indexed > {max_storage_gb} GB cap — "
+            "purging oldest recordings"
+        )
+        stats: dict[str, Any] = {
+            "deleted_files": 0,
+            "deleted_records": 0,
+            "freed_space_mb": 0,
+        }
+        target = cap_bytes - RetentionService.FREE_SPACE_HYSTERESIS_GB * gb
+        floor = datetime.now(UTC) - RetentionService.SPACE_PURGE_MIN_AGE
+        exhausted_reason: str | None = None
+
+        for _ in range(RetentionService.MAX_SPACE_BATCHES):
+            if used <= target:
+                break
+            q = db.query(Recording).filter(Recording.start_time < floor)
+            if protect_flagged:
+                q = q.filter(Recording.is_flagged == False)  # noqa: E712
+            rows = (
+                q.order_by(Recording.start_time.asc())
+                .limit(RetentionService.DELETE_BATCH_SIZE)
+                .all()
+            )
+            if not rows:
+                exhausted_reason = "no deletable recordings older than 24 h left"
+                break
+            # Take only as many as needed to reach the target.
+            batch: list = []
+            batch_bytes = 0
+            for r in rows:
+                batch.append(r)
+                batch_bytes += int(r.file_size or 0)
+                if used - batch_bytes <= target:
+                    break
+            if batch_bytes == 0:
+                # Rows with no recorded size don't count toward the cap, so
+                # deleting them can't bring it down — stop rather than
+                # spin-delete. The reconciler fills sizes in from disk.
+                exhausted_reason = (
+                    f"oldest {len(rows)} recordings have no recorded size"
+                )
+                break
+            RetentionService._delete_rows_batch(db, base_path, batch, stats)
+            used -= batch_bytes
+        else:
+            if used > target:
+                exhausted_reason = (
+                    f"batch cap reached ({RetentionService.MAX_SPACE_BATCHES})"
+                )
+
+        stats["indexed_gb_after"] = round(used / gb, 1)
+        if used > cap_bytes:
+            desc = (
+                f"Storage cap exhausted: {used / gb:.1f} GB indexed > "
+                f"{max_storage_gb} GB cap ({exhausted_reason or 'nothing left to delete'})"
+            )
+            recording_logger.warning(desc)
+            RetentionService._set_cap_exhausted(True, used, cap_bytes, description=desc)
+            stats["exhausted"] = True
+        else:
+            RetentionService._set_cap_exhausted(False, used, cap_bytes)
+        return stats
+
+    @staticmethod
+    def _set_cap_exhausted(
+        active: bool,
+        used_bytes: float,
+        cap_bytes: float,
+        description: str | None = None,
+    ) -> None:
+        """Edge-triggered storage_cap_exhausted alert. Best-effort."""
+        gb = 1024**3
+        try:
+            from services.system_events import record_system_event_edge
+
+            record_system_event_edge(
+                event_type="storage_cap_exhausted",
+                active=active,
+                severity="critical",
+                description=description
+                or f"Storage cap recovered: {used_bytes / gb:.1f} GB indexed",
+                data={
+                    "indexed_gb": round(used_bytes / gb, 1),
+                    "cap_gb": round(cap_bytes / gb, 1),
+                },
+            )
+        except Exception as e:
+            recording_logger.warning(f"storage_cap_exhausted event failed: {e}")
+
     # Evidence JPEGs share the recordings volume under .evidence/ but the old
     # retention only globbed *.mp4 — they accumulated forever.
     @staticmethod
@@ -856,11 +1030,13 @@ class RetentionService:
 
     @staticmethod
     def check_disk_pressure(db: Session = None) -> dict[str, Any] | None:
-        """Fast free-space check + oldest-first purge when below threshold.
+        """Fast storage-cap and free-space checks + oldest-first purges.
 
         Called every few minutes (see main.py) — a near-full disk cannot wait
         for the daily sweep. Cheap when there's nothing to do: one settings
-        read and one ``disk_usage`` call.
+        read, one SUM over the index (cap) and one ``disk_usage`` call
+        (free-space floor). Returns the combined purge stats, or None when
+        nothing was deleted.
         """
         close_db = False
         if db is None:
@@ -869,53 +1045,53 @@ class RetentionService:
         try:
             settings_dict = RetentionService._get_retention_settings(db)
             min_free = settings_dict.get("min_free_space_gb")
-            if not min_free:
+            max_storage = settings_dict.get("max_storage_gb")
+            if not min_free and not max_storage:
                 return None
             base_path = Path(get_effective_recordings_base_path(db))
             if not base_path.exists():
                 return None
-            free_gb = RetentionService._get_disk_free_space_gb(str(base_path))
-            if free_gb is None:
-                # Fail-safe: unknown disk state, don't purge. The system
-                # monitor raises disk_stat_error for visibility.
-                return None
-            if free_gb >= min_free:
-                return None
-            recording_logger.warning(
-                f"Disk pressure: {free_gb:.1f}GB free < {min_free}GB threshold — "
-                "purging oldest recordings"
-            )
-            stats = RetentionService._cleanup_by_space(
-                db,
-                base_path,
-                min_free,
-                settings_dict.get("protect_flagged", True),
-                purge_orphaned=settings_dict.get(
-                    "purge_orphaned_under_pressure", False
-                ),
-            )
-            # History row for the purge itself (discrete occurrence, not an
-            # active/inactive pair). The async loop in main.py publishes the
-            # live bus copy — this thread only persists.
-            try:
-                from services.system_events import record_system_event
+            protect_flagged = settings_dict.get("protect_flagged", True)
 
-                freed_gb = stats.get("freed_space_mb", 0) / 1024
-                record_system_event(
-                    db,
-                    event_type="disk_pressure_purge",
-                    state=None,
-                    severity="warning",
-                    description=(
-                        f"Disk pressure purge: deleted "
-                        f"{stats.get('deleted_files', 0)} files "
-                        f"({freed_gb:.1f} GB) at {free_gb:.1f} GB free"
-                    ),
-                    data={"free_gb_before": round(free_gb, 1), **stats},
+            results: list[dict[str, Any]] = []
+            if max_storage:
+                stats = RetentionService._cleanup_by_size_cap(
+                    db, base_path, max_storage, protect_flagged
                 )
-            except Exception as e:
-                recording_logger.warning(f"disk_pressure_purge event failed: {e}")
-            return stats
+                if stats is not None:
+                    RetentionService._record_purge_event(
+                        db,
+                        "storage_cap_purge",
+                        f"Storage cap purge: deleted {stats.get('deleted_files', 0)} "
+                        f"files ({stats.get('freed_space_mb', 0) / 1024:.1f} GB), "
+                        f"{stats.get('indexed_gb_after')} GB of {max_storage} GB cap "
+                        "now indexed",
+                        {"max_storage_gb": max_storage, **stats},
+                    )
+                    results.append(stats)
+            if min_free:
+                stats = RetentionService._check_min_free_space(
+                    db, base_path, min_free, settings_dict
+                )
+                if stats is not None:
+                    results.append(stats)
+
+            if not results:
+                return None
+            combined: dict[str, Any] = {}
+            for stats in results:
+                for k, v in stats.items():
+                    if isinstance(v, bool):
+                        combined[k] = combined.get(k, False) or v
+                    elif isinstance(v, (int, float)) and k in (
+                        "deleted_files",
+                        "deleted_records",
+                        "freed_space_mb",
+                    ):
+                        combined[k] = combined.get(k, 0) + v
+                    else:
+                        combined[k] = v
+            return combined
         except Exception as e:
             recording_logger.error(f"Disk pressure check failed: {e}", exc_info=True)
             return None
@@ -923,6 +1099,71 @@ class RetentionService:
             if close_db:
                 db.close()
 
+    @staticmethod
+    def _check_min_free_space(
+        db: Session,
+        base_path: Path,
+        min_free: float,
+        settings_dict: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Free-space floor half of ``check_disk_pressure``."""
+        problem = RetentionService._disk_reading_problem(db, base_path, settings_dict)
+        if problem:
+            # A reading that can't be the real disk (e.g. a >16 TiB volume
+            # through Docker Desktop on macOS) would purge footage the disk
+            # has room for. Skip; the storage cap is the safe alternative.
+            recording_logger.warning(
+                f"Disk pressure check skipped: disk reading is implausible ({problem})"
+            )
+            return None
+        free_gb = RetentionService._get_disk_free_space_gb(str(base_path))
+        if free_gb is None:
+            # Fail-safe: unknown disk state, don't purge. The system
+            # monitor raises disk_stat_error for visibility.
+            return None
+        if free_gb >= min_free:
+            return None
+        recording_logger.warning(
+            f"Disk pressure: {free_gb:.1f}GB free < {min_free}GB threshold — "
+            "purging oldest recordings"
+        )
+        stats = RetentionService._cleanup_by_space(
+            db,
+            base_path,
+            min_free,
+            settings_dict.get("protect_flagged", True),
+            purge_orphaned=settings_dict.get("purge_orphaned_under_pressure", False),
+        )
+        freed_gb = stats.get("freed_space_mb", 0) / 1024
+        RetentionService._record_purge_event(
+            db,
+            "disk_pressure_purge",
+            f"Disk pressure purge: deleted {stats.get('deleted_files', 0)} files "
+            f"({freed_gb:.1f} GB) at {free_gb:.1f} GB free",
+            {"free_gb_before": round(free_gb, 1), **stats},
+        )
+        return stats
+
+    @staticmethod
+    def _record_purge_event(
+        db: Session, event_type: str, description: str, data: dict[str, Any]
+    ) -> None:
+        """History row for a purge (discrete occurrence, not an
+        active/inactive pair). The async loop in main.py publishes the live
+        bus copy — this thread only persists."""
+        try:
+            from services.system_events import record_system_event
+
+            record_system_event(
+                db,
+                event_type=event_type,
+                state=None,
+                severity="warning",
+                description=description,
+                data=data,
+            )
+        except Exception as e:
+            recording_logger.warning(f"{event_type} event failed: {e}")
 
 # Singleton instance
 retention_service = RetentionService()

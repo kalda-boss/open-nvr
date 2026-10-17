@@ -237,6 +237,7 @@ export type SystemResourcesResp = {
   memory?: { total: number; used: number; percent: number } | null
   disk?: { path: string; total: number; used: number; free: number; percent: number } | null
   disk_error?: string | null
+  disk_unreliable?: string | null
   active_alerts?: { alert_type: string; severity: string; description: string; since?: string }[]
   thresholds?: {
     enabled?: boolean

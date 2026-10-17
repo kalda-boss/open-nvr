@@ -26,7 +26,8 @@ deleted. This service converges the two:
 * DB rows whose file is gone are DELETED;
 * rows that already exist are NEVER updated — the webhook's richer data
   (exact duration, codec) wins, and old rows keep the timestamps they were
-  written with even if parsing conventions evolve.
+  written with even if parsing conventions evolve. The one exception is a
+  missing ``file_size``, which is filled from disk (the storage cap needs it).
 
 Runs at startup as a full-history backfill (this is also the one-time import
 of pre-existing recordings), then periodically over a recent window. All
@@ -83,6 +84,7 @@ def reconcile_camera(
     """Converge one camera's directory with its DB rows.
 
     Returns ``(inserted, deleted)``. ``window_start=None`` means full history.
+    Also fills ``file_size`` on existing rows that lack it (not counted).
     """
     cam_dir = root / f"cam-{int(camera_id)}"
     now = time.time()
@@ -178,6 +180,13 @@ def reconcile_camera(
         inserted += 1
         if inserted % 500 == 0:
             db.commit()  # bound transaction size on big backfills
+
+    # Rows with no size → fill it in. The storage cap sums file_size, so a
+    # NULL would hide that clip's bytes from it (webhook rows were NULL for
+    # a long time — see mediamtx_hooks.hook_segment_complete).
+    for rel, row in db_rows.items():
+        if row.file_size is None and rel in on_disk:
+            row.file_size = on_disk[rel][2]
 
     # Rows whose file is gone → delete. Only within the scanned window, where
     # the disk picture is authoritative.

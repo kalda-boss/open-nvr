@@ -1114,6 +1114,11 @@ class RecordingRetentionSettings(BaseModel):
     retention_days: int | None = Field(30, ge=0, le=3650)
     protect_flagged: bool = True
     min_free_space_gb: int | None = Field(None, ge=1, le=100000)
+    # Storage cap: keep the indexed recordings' total size (SUM of file_size)
+    # under this many GB, deleting oldest-first. Unlike min_free_space_gb it
+    # never asks the filesystem, so it works where free space is misreported
+    # (e.g. a >16 TiB volume bind-mounted through Docker Desktop on macOS).
+    max_storage_gb: int | None = Field(None, ge=1, le=1000000)
     # Under disk pressure, also purge quarantined orphaned/ footage after all
     # indexed recordings are exhausted. Off by default: quarantine is meant to
     # stay recoverable (see retention_service._cleanup_orphans_by_age).
