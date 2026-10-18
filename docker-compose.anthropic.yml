@@ -18,10 +18,22 @@
 #     ANTHROPIC_API_KEY=sk-ant-...
 #     LLM_MODEL=claude-haiku-5-5      # optional; the default here
 #     LLM_EFFORT=low                  # optional; low | medium | high | ...
+#     # or, instead of the key, Workload Identity Federation:
+#     # ANTHROPIC_FEDERATION_RULE_ID=... (see docs/ANTHROPIC_WIF.md)
 #     AI_SOVEREIGNTY=federated        # KAI-C refuses a cloud adapter under local_only
 # and ./start.sh adds this file by itself whenever a camera-agent profile
 # is configured. Frames and chat text leave the machine for
 # api.anthropic.com; nothing else does.
+
+# Workload Identity Federation instead of ANTHROPIC_API_KEY: blank unless
+# .env sets the ANTHROPIC_FEDERATION_RULE_ID group (docs/ANTHROPIC_WIF.md),
+# and the SDK treats blank as unset, so these are inert on the key path.
+# Each workload reads its own token from the anthropic-issuer's volume.
+x-anthropic-wif-env: &anthropic-wif-env
+  ANTHROPIC_FEDERATION_RULE_ID: ${ANTHROPIC_FEDERATION_RULE_ID:-}
+  ANTHROPIC_ORGANIZATION_ID: ${ANTHROPIC_ORGANIZATION_ID:-}
+  ANTHROPIC_SERVICE_ACCOUNT_ID: ${ANTHROPIC_SERVICE_ACCOUNT_ID:-}
+  ANTHROPIC_WORKSPACE_ID: ${ANTHROPIC_WORKSPACE_ID:-}
 
 services:
   # Parked, as in docker-compose.camera-agent.external-llm.yml: compose has
@@ -62,6 +74,11 @@ services:
         condition: service_healthy
       opennvr-core:
         condition: service_healthy
+    environment:
+      <<: *anthropic-wif-env
+      ANTHROPIC_IDENTITY_TOKEN_FILE: /var/run/secrets/anthropic.com/camera-agent.jwt
+    volumes:
+      - opennvr_anthropic_identity:/var/run/secrets/anthropic.com:ro
 
   camera-agent-chat:
     depends_on: !override
@@ -73,6 +90,11 @@ services:
         condition: service_healthy
       opennvr-core:
         condition: service_healthy
+    environment:
+      <<: *anthropic-wif-env
+      ANTHROPIC_IDENTITY_TOKEN_FILE: /var/run/secrets/anthropic.com/camera-agent.jwt
+    volumes:
+      - opennvr_anthropic_identity:/var/run/secrets/anthropic.com:ro
 
   caption-adapter:
     build:
@@ -82,9 +104,13 @@ services:
     pull_policy: ${APPS_PULL_POLICY:-build}
     command: !override ["uvicorn", "adapters.claudevlm.main:app", "--host", "0.0.0.0", "--port", "9006"]
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENNVR_CLAUDE_VLM_MODEL=${LLM_MODEL:-claude-haiku-5-5}
-      - OPENNVR_CLAUDE_VLM_EFFORT=${LLM_EFFORT:-low}
+      <<: *anthropic-wif-env
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_IDENTITY_TOKEN_FILE: /var/run/secrets/anthropic.com/caption-adapter.jwt
+      OPENNVR_CLAUDE_VLM_MODEL: ${LLM_MODEL:-claude-haiku-5-5}
+      OPENNVR_CLAUDE_VLM_EFFORT: ${LLM_EFFORT:-low}
+    volumes:
+      - opennvr_anthropic_identity:/var/run/secrets/anthropic.com:ro
 
   caption-adapter-register:
     environment:

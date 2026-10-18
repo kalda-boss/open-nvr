@@ -919,6 +919,32 @@ services:
       - OPENNVR_HTTPS_PORT=${NGINX_HOST_HTTPS_PORT:-443}
       - OPENNVR_MDNS_NAME=${OPENNVR_MDNS_NAME:-OpenNVR}
 
+  # ──────────────────────────────────────────────────────────────
+  # Anthropic identity issuer (Workload Identity Federation)
+  # ──────────────────────────────────────────────────────────────
+  # With LLM_PROVIDER=anthropic and ANTHROPIC_FEDERATION_RULE_ID set,
+  # start.sh enables this profile: the Claude workloads then exchange a
+  # short-lived JWT signed here for an access token instead of reading a
+  # static ANTHROPIC_API_KEY. Its public key is registered inline in the
+  # Claude Console, so it needs no network. docs/ANTHROPIC_WIF.md.
+  # ──────────────────────────────────────────────────────────────
+  anthropic-issuer:
+    profiles: [anthropic-wif]
+    build:
+      context: .
+      dockerfile: scripts/anthropic-issuer/Dockerfile
+    image: opennvr/anthropic-issuer:local-build
+    pull_policy: ${APPS_PULL_POLICY:-build}
+    container_name: opennvr_anthropic_issuer
+    logging: *svc-logs
+    restart: unless-stopped
+    network_mode: none
+    environment:
+      - ANTHROPIC_WIF_ISSUER=${ANTHROPIC_WIF_ISSUER:-}
+    volumes:
+      - opennvr_anthropic_issuer_key:/keys
+      - opennvr_anthropic_identity:/tokens
+
 networks:
   # Where apps live (docker-compose.apps.yml): INTERNAL — no route to the
   # LAN or the internet. Apps reach core, the buses and the egress proxy
@@ -961,3 +987,8 @@ volumes:
   # volume forgets app-registered adapters — re-run the app overlay's
   # registrar (or re-register on the AI Models page) to restore them.
   opennvr_kai_c_state:
+  # Anthropic WIF: the issuer's signing key (never mounted anywhere else;
+  # removing it means registering a new public key in the Console), and
+  # the short-lived tokens it hands the Claude workloads (read-only there).
+  opennvr_anthropic_issuer_key:
+  opennvr_anthropic_identity:

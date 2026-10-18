@@ -31,7 +31,8 @@ whisper_token: ${INTERNAL_API_KEY}
 ollama_url: ${OLLAMA_URL}
 ollama_token:
 # LLM_PROVIDER in .env: "ollama" (default) or "anthropic" (Claude; the key
-# is the container's ANTHROPIC_API_KEY env var, never written here).
+# is the container's ANTHROPIC_API_KEY env var, or workload identity
+# federation — docs/ANTHROPIC_WIF.md; neither is ever written here).
 # llm_effort is Claude's thinking depth and is ignored by Ollama.
 llm_provider: ${LLM_PROVIDER}
 llm_effort: ${LLM_EFFORT}

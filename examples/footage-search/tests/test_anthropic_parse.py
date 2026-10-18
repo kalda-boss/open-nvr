@@ -72,3 +72,23 @@ def test_shipped_docker_template_carries_the_provider_placeholders():
     text = (Path(__file__).resolve().parent.parent / "config.docker.yml").read_text()
     for var in ("LLM_PROVIDER", "LLM_MODEL", "LLM_EFFORT"):
         assert "${" + var + "}" in text
+
+
+def test_reuses_one_sdk_client_across_queries(monkeypatch):
+    # Under workload identity federation every new client re-exchanges
+    # its identity token; one per process keeps the access token.
+    import sys
+    import query
+
+    built = []
+
+    class _FakeAnthropic:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+            self.messages = _Client('{"labels": ["person"]}')
+
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=_FakeAnthropic))
+    monkeypatch.setattr(query, "_ANTHROPIC_CLIENTS", {})
+    for q in ("people", "people again"):
+        parse_with_anthropic(q, now=NOW, model="claude-haiku-5-5")
+    assert len(built) == 1

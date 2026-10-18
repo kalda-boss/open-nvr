@@ -67,6 +67,21 @@ _MEDIA_TYPES: tuple[tuple[bytes, str], ...] = (
 )
 
 
+def _credential_source() -> str | None:
+    """Which credential the SDK will use, mirroring its precedence: an API
+    key (or bearer token), else a profile, else workload identity
+    federation (rule + organization + identity token). Blank counts as
+    unset, as it does in the SDK — compose passes unused ones as ``""``."""
+    if os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
+        return "api_key"
+    if os.getenv("ANTHROPIC_PROFILE"):
+        return "profile"
+    if (os.getenv("ANTHROPIC_FEDERATION_RULE_ID") and os.getenv("ANTHROPIC_ORGANIZATION_ID")
+            and (os.getenv("ANTHROPIC_IDENTITY_TOKEN_FILE") or os.getenv("ANTHROPIC_IDENTITY_TOKEN"))):
+        return "federation"
+    return None
+
+
 def _media_type(data: bytes) -> str | None:
     for magic, media_type in _MEDIA_TYPES:
         if data.startswith(magic):
@@ -89,8 +104,10 @@ class ClaudeVlmService(AdapterService):
         self._model = model or os.getenv("OPENNVR_CLAUDE_VLM_MODEL") or DEFAULT_MODEL
         self._effort = effort or os.getenv("OPENNVR_CLAUDE_VLM_EFFORT") or DEFAULT_EFFORT
         self._timeout = float(os.getenv("OPENNVR_CLAUDE_VLM_TIMEOUT_S", "60"))
-        self._has_key = client is not None or bool(os.getenv("ANTHROPIC_API_KEY"))
-        # ``client`` is injectable for tests; the real one reads ANTHROPIC_API_KEY.
+        self._credential = "injected" if client is not None else _credential_source()
+        self._has_key = self._credential is not None
+        # ``client`` is injectable for tests; the real one resolves its own
+        # credentials (ANTHROPIC_API_KEY, or workload identity federation).
         self._client = client
         self._ready = False
         self._last_error: str | None = None
@@ -123,8 +140,9 @@ class ClaudeVlmService(AdapterService):
     def hardware_evaluation(self) -> HardwareEvaluationResponse:
         if not self._has_key:
             verdict = HardwareVerdict.WARN
-            reasoning = ("ANTHROPIC_API_KEY is not set — every inference will "
-                         "fail until it is (set it in .env and restart).")
+            reasoning = ("No Anthropic credentials: neither ANTHROPIC_API_KEY nor "
+                         "workload identity federation is set — every inference "
+                         "will fail until one is (set it in .env and restart).")
         elif self._last_error:
             verdict = HardwareVerdict.WARN
             reasoning = f"Last call to the Anthropic API failed: {self._last_error}"
@@ -143,6 +161,7 @@ class ClaudeVlmService(AdapterService):
                 "model": self._model,
                 "effort": self._effort,
                 "api_key_set": self._has_key,
+                "credential": self._credential,
                 "cpu_count": os.cpu_count() or 0,
                 "platform": platform.platform(),
                 "python_version": platform.python_version(),
@@ -209,7 +228,8 @@ class ClaudeVlmService(AdapterService):
         if self._client is None:
             raise ServiceError(
                 ErrorCategory.PROVIDER_ERROR, code="api_key_missing",
-                message="ANTHROPIC_API_KEY is not set for the caption adapter",
+                message=("No Anthropic credentials (ANTHROPIC_API_KEY or workload "
+                         "identity federation) for the caption adapter"),
                 transient=False, http_status=503,
             )
         try:

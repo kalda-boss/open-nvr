@@ -120,8 +120,39 @@ def test_a_refusal_is_reported_not_returned_as_a_caption():
     assert "declined" in info.value.message
 
 
+_CREDENTIAL_VARS = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE",
+    "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE", "ANTHROPIC_IDENTITY_TOKEN",
+)
+
+
+def _clear_credentials(monkeypatch):
+    for var in _CREDENTIAL_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_federation_counts_as_credentials(monkeypatch):
+    _clear_credentials(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")  # compose passes it blank
+    monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "fdrl_test")
+    monkeypatch.setenv("ANTHROPIC_ORGANIZATION_ID", "00000000-0000-0000-0000-000000000000")
+    monkeypatch.setenv("ANTHROPIC_IDENTITY_TOKEN_FILE", "/var/run/secrets/anthropic.com/x.jwt")
+    svc = ClaudeVlmService()
+    hw = svc.hardware_evaluation()
+    assert hw.verdict == HardwareVerdict.OK
+    assert hw.details["credential"] == "federation"
+
+
+def test_partial_federation_is_not_credentials(monkeypatch):
+    _clear_credentials(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_FEDERATION_RULE_ID", "fdrl_test")
+    monkeypatch.setenv("ANTHROPIC_IDENTITY_TOKEN_FILE", "/var/run/secrets/anthropic.com/x.jwt")
+    assert ClaudeVlmService().hardware_evaluation().verdict == HardwareVerdict.WARN
+
+
 def test_ready_without_a_key_but_says_why_it_cannot_answer(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _clear_credentials(monkeypatch)
     svc = ClaudeVlmService()
     svc.load()
     assert svc.is_ready(), "a missing key must not fail the healthcheck"
