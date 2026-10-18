@@ -244,6 +244,22 @@ def parse_with_ollama(
     return _filter_from_llm(data, now=now)
 
 
+_ANTHROPIC_CLIENTS: dict[float, object] = {}
+
+
+def _anthropic_client(timeout_seconds: float) -> object:
+    """One SDK client per process (per timeout), not one per query: under
+    workload identity federation each new client exchanges its identity
+    token again, and a reused one keeps its access token and connections."""
+    client = _ANTHROPIC_CLIENTS.get(timeout_seconds)
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic(timeout=timeout_seconds, max_retries=1)
+        _ANTHROPIC_CLIENTS[timeout_seconds] = client
+    return client
+
+
 def parse_with_anthropic(
     query: str,
     *,
@@ -255,9 +271,10 @@ def parse_with_anthropic(
     timeout_seconds: float = 20.0,
     client: object | None = None,
 ) -> QueryFilter:
-    """``parse_with_ollama`` on Claude. The key comes from the
-    ANTHROPIC_API_KEY env var; the SDK honours HTTPS_PROXY, which is how
-    a compose install reaches the API through the apps egress proxy.
+    """``parse_with_ollama`` on Claude. Credentials come from the
+    environment: ANTHROPIC_API_KEY, or workload identity federation; the
+    SDK honours HTTPS_PROXY, which is how a compose install reaches the
+    API through the apps egress proxy.
     Falls back to ``parse_heuristic`` on any error, logged — a missing
     key or a denied egress should be findable, not just quietly worse."""
     import json
@@ -266,9 +283,7 @@ def parse_with_anthropic(
     system = _llm_system_prompt(label_vocab, camera_aliases)
     try:
         if client is None:
-            import anthropic
-
-            client = anthropic.Anthropic(timeout=timeout_seconds, max_retries=1)
+            client = _anthropic_client(timeout_seconds)
         resp = client.messages.create(
             model=model,
             max_tokens=1024,

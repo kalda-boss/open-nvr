@@ -134,6 +134,15 @@ compose_args() {
             args="$args --profile default-apps"
             ;;
     esac
+    # Claude through Workload Identity Federation (.env
+    # ANTHROPIC_FEDERATION_RULE_ID): start the anthropic-issuer whose
+    # short-lived tokens replace ANTHROPIC_API_KEY. docs/ANTHROPIC_WIF.md.
+    local wif_provider wif_rule
+    wif_provider=$(get_env_var "LLM_PROVIDER" 2>/dev/null | tail -n1 | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//')
+    wif_rule=$(get_env_var "ANTHROPIC_FEDERATION_RULE_ID" 2>/dev/null | tail -n1 | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//')
+    if [[ "$(printf '%s' "$wif_provider" | tr '[:upper:]' '[:lower:]')" == anthropic && -n "$wif_rule" ]]; then
+        args="$args --profile anthropic-wif"
+    fi
     # Opt-in host-side debug ports for mediamtx. Off by default because
     # Docker's publishing is all-or-nothing per container — see the header
     # of docker-compose.debug-ports.yml and #298.

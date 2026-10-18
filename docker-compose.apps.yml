@@ -1502,10 +1502,19 @@ services:
       # api.anthropic.com through the proxy above, so allow that host on
       # the app's card (App Catalog → Footage Search → egress).
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # ...or Workload Identity Federation instead of the key: blank (and
+      # so inert) unless .env sets them. docs/ANTHROPIC_WIF.md.
+      - ANTHROPIC_FEDERATION_RULE_ID=${ANTHROPIC_FEDERATION_RULE_ID:-}
+      - ANTHROPIC_ORGANIZATION_ID=${ANTHROPIC_ORGANIZATION_ID:-}
+      - ANTHROPIC_SERVICE_ACCOUNT_ID=${ANTHROPIC_SERVICE_ACCOUNT_ID:-}
+      - ANTHROPIC_WORKSPACE_ID=${ANTHROPIC_WORKSPACE_ID:-}
+      - ANTHROPIC_IDENTITY_TOKEN_FILE=/var/run/secrets/anthropic.com/footage-search.jwt
     expose:
       - "9208"
     volumes:
       - opennvr_footage_search_config:/app/config:ro
+      # The anthropic-issuer's short-lived tokens (empty without WIF).
+      - opennvr_anthropic_identity:/var/run/secrets/anthropic.com:ro
       # No data volume: the app is stateless between restarts. Anything
       # it can tell you, it reads from core when asked.
     command:
