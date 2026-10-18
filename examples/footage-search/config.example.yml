@@ -62,6 +62,15 @@ ollama:
   url: "http://ollama:11434"
   model: "llama3.2"
 
+# ── Optional LLM query parsing (Claude) ────────────────────────────
+# llm_provider: anthropic parses queries with Claude instead (the
+# ``ollama`` section is then ignored). The API key is the
+# ANTHROPIC_API_KEY env var. Same heuristic fallback on any error.
+# llm_provider: anthropic
+# anthropic:
+#   model: "claude-haiku-5-5"
+#   effort: "low"
+
 # ── App contract (spec §03) ───────────────────────────────────────
 #
 # Serves /health /manifest /state and the POST /actions search surface,

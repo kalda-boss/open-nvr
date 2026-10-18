@@ -102,10 +102,20 @@ compose_args() {
         # operator's endpoint instead — the GPU path on macOS/Windows,
         # where the in-VM container is CPU-only. Only meaningful for the
         # camera-agent profiles, and harmless to append with them.
-        local external_llm
+        # Claude (.env LLM_PROVIDER=anthropic) needs no LLM runtime at all:
+        # its overlay parks ollama and swaps the captioner for claudevlm,
+        # so it replaces the external-LLM one rather than joining it.
+        local external_llm llm_provider
         external_llm=$(get_env_var "OLLAMA_EXTERNAL_URL")
-        if [[ -n "$external_llm" && "$example_compose" == *camera-agent.yml* ]]; then
-            args="$args -f docker-compose.camera-agent.external-llm.yml"
+        # Inline "# comment" stripped: compose reads .env that way too.
+        # Last line wins, as in compose's own .env parsing.
+        llm_provider=$(get_env_var "LLM_PROVIDER" 2>/dev/null | tail -n1 | sed 's/[[:space:]]*#.*//; s/[[:space:]]*$//')
+        if [[ "$example_compose" == *camera-agent.yml* ]]; then
+            if [[ "$(printf '%s' "$llm_provider" | tr '[:upper:]' '[:lower:]')" == anthropic ]]; then
+                args="$args -f docker-compose.anthropic.yml"
+            elif [[ -n "$external_llm" ]]; then
+                args="$args -f docker-compose.camera-agent.external-llm.yml"
+            fi
         fi
     fi
     local p

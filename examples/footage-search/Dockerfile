@@ -38,6 +38,8 @@ WORKDIR /app
 # surface.
 COPY sdk/opennvr-app-sdk /opt/opennvr-app-sdk
 RUN pip install --no-cache-dir /opt/opennvr-app-sdk
+# The Claude query parser (llm_provider: anthropic); same pin as pyproject.
+RUN pip install --no-cache-dir "anthropic>=1.0,<2"
 
 # The entry module's full import graph: query.py (NL → structured
 # filter parsers). store.py is gone with the index it owned. A missed

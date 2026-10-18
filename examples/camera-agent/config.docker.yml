@@ -30,6 +30,11 @@ whisper_url: http://whisper-adapter:9003
 whisper_token: ${INTERNAL_API_KEY}
 ollama_url: ${OLLAMA_URL}
 ollama_token:
+# LLM_PROVIDER in .env: "ollama" (default) or "anthropic" (Claude; the key
+# is the container's ANTHROPIC_API_KEY env var, never written here).
+# llm_effort is Claude's thinking depth and is ignored by Ollama.
+llm_provider: ${LLM_PROVIDER}
+llm_effort: ${LLM_EFFORT}
 piper_url: http://piper-adapter:9001
 piper_token: ${INTERNAL_API_KEY}
 
@@ -107,7 +112,7 @@ enabled_tools:
 # BOTH the model pull and this config; qwen2.5:0.5b is the low-RAM floor.
 # Whichever model you pick, it MUST support tool calling — see
 # https://ollama.com/blog/tool-support.
-llm_model: ${OLLAMA_MODEL}
+llm_model: ${LLM_MODEL}   # LLM_MODEL in .env; falls back to OLLAMA_MODEL
 # Pre-set so that IF you switch OLLAMA_MODEL to a "thinking" model (e.g. a qwen3)
 # it stays snappy and non-verbose; a harmless no-op for the non-thinking qwen2.5
 # default.

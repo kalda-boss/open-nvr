@@ -66,10 +66,12 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from adapter_clients import (
+    AnthropicLLMClient,
     AppRegistryClient,
     AuthUnavailable,
     KaicAdapterClient,
     KaicCapabilitiesClient,
+    LLMCallError,
     OllamaClient,
     OpenAILLMClient,
     OpennvrAuthClient,
@@ -194,9 +196,13 @@ class AppConfig:
     # "openai" → any OpenAI-compatible chat API at llm_base_url (cloud or a
     # local OpenAI-API server) with llm_api_key. The cloud/hybrid path gives
     # stronger, lower-latency tool-calling without a local LLM (issue #82).
+    # "anthropic" → Claude via the Anthropic SDK; llm_api_key (or the
+    # ANTHROPIC_API_KEY env var) and llm_model (e.g. claude-haiku-5-5).
     llm_provider: str = "ollama"
     llm_base_url: str | None = None
     llm_api_key: str | None = None
+    # anthropic only: thinking depth (low | medium | high | xhigh | max).
+    llm_effort: str = "low"
     piper_url: str = "http://127.0.0.1:9001"
     piper_token: str = ""
     # Which Piper voice to ask for, per request (the adapter honours a
@@ -3015,6 +3021,7 @@ def load_config(path: str | Path) -> AppConfig:
         llm_provider=_str("llm_provider", "ollama"),
         llm_base_url=raw.get("llm_base_url"),
         llm_api_key=raw.get("llm_api_key"),
+        llm_effort=_str("llm_effort", "low"),
         llm_think=(None if raw.get("llm_think") is None else bool(raw.get("llm_think"))),
         llm_num_threads=(int(raw["llm_num_threads"]) if raw.get("llm_num_threads") else None),
         llm_num_ctx=int(raw.get("llm_num_ctx") or 4096),
@@ -3191,7 +3198,17 @@ class CameraAgentRuntime:
             )
 
         self.whisper = WhisperClient(url=cfg.whisper_url, token=cfg.whisper_token)
-        if cfg.llm_provider.strip().lower() == "openai":
+        provider = cfg.llm_provider.strip().lower()
+        if provider == "anthropic":
+            self.ollama = AnthropicLLMClient(
+                api_key=cfg.llm_api_key or None,
+                model=cfg.llm_model,
+                effort=cfg.llm_effort,
+                base_url=cfg.llm_base_url or None,
+            )
+            logger.info("LLM brain: Anthropic (model=%s, effort=%s)",
+                        cfg.llm_model, cfg.llm_effort)
+        elif provider == "openai":
             self.ollama = OpenAILLMClient(
                 base_url=cfg.llm_base_url or cfg.ollama_url,
                 api_key=cfg.llm_api_key or cfg.ollama_token or None,
@@ -4821,6 +4838,8 @@ class CameraAgentRuntime:
         async def check_llm():
             if self.cfg.llm_provider.strip().lower() == "openai":
                 return OK, "external OpenAI-compatible endpoint (not probed)"
+            if self.cfg.llm_provider.strip().lower() == "anthropic":
+                return OK, f"Anthropic API, model {self.cfg.llm_model} (not probed)"
             url = f"{self.cfg.ollama_url.rstrip('/')}/api/tags"
             async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.get(url)
@@ -7520,11 +7539,17 @@ async def _chat_or_explain(runtime: "CameraAgentRuntime", **kw: Any) -> dict[str
     The URL in the message is the one the AGENT dials — on a compose install
     that is ``host.docker.internal:11434``, and naming it is what turns
     "assistant failed" into "go start Ollama on the host"."""
+    provider = runtime.cfg.llm_provider.strip().lower()
     where = (runtime.cfg.llm_base_url or runtime.cfg.ollama_url
-             if runtime.cfg.llm_provider.strip().lower() == "openai"
+             if provider == "openai"
+             else "the Anthropic API" if provider == "anthropic"
              else runtime.cfg.ollama_url)
     try:
         response = await runtime.ollama.chat(**kw)
+    except LLMCallError as exc:
+        msg = f"LLM at {where} {exc}"
+        runtime.last_llm_error = msg
+        raise LLMTurnError(msg) from exc
     except httpx.HTTPStatusError as exc:
         # The body is the diagnosis ("model X not found, try pulling it
         # first") — keep it. Cap it: error pages can be arbitrarily long.

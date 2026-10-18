@@ -22,6 +22,8 @@ Two parsers, same output type:
   ("someone in a hoodie loitering by the gate after dark"). Falls back
   to the heuristic parser on any error, so enabling it never makes
   search worse.
+* ``parse_with_anthropic`` — the same, on Claude through the Anthropic
+  SDK (``llm_provider: anthropic``). Same prompt, same fallback.
 
 Time is resolved relative to an injected ``now`` so parsing is testable.
 """
@@ -165,6 +167,39 @@ def _extract_time(
     return None, None, q
 
 
+def _llm_system_prompt(label_vocab: Iterable[str] | None,
+                       camera_aliases: dict[str, str] | None) -> str:
+    vocab = sorted({s.lower() for s in (label_vocab or DEFAULT_LABELS)})
+    cameras = sorted({v for v in (camera_aliases or {}).values()})
+    return (
+        "You convert a surveillance footage-search request into JSON. "
+        "Return ONLY a JSON object with keys: labels (array of object "
+        f"classes from this list: {vocab}), keywords (array of other "
+        "descriptive words like colors or clothing, matched against scene "
+        "captions), relative_time (one of: null, 'today', 'yesterday', "
+        "'this_morning', 'tonight', or an integer number of minutes for a "
+        "rolling window), camera (one of "
+        f"{cameras or ['null']} or null). No prose."
+    )
+
+
+def _filter_from_llm(data: dict, *, now: _dt.datetime) -> QueryFilter:
+    labels = [str(s).lower() for s in (data.get("labels") or []) if s]
+    labels = [_LABEL_ALIASES.get(s, s) for s in labels]
+    keywords = [str(s).lower() for s in (data.get("keywords") or []) if s]
+    camera_id = data.get("camera") or None
+    if camera_id in (None, "null"):
+        camera_id = None
+
+    since, until = _resolve_relative_time(data.get("relative_time"), now=now)
+    return QueryFilter(
+        labels=list(dict.fromkeys(labels)),
+        keywords=list(dict.fromkeys(keywords)),
+        since=since, until=until,
+        camera_id=str(camera_id) if camera_id else None,
+    )
+
+
 def parse_with_ollama(
     query: str,
     *,
@@ -183,18 +218,7 @@ def parse_with_ollama(
 
     import httpx
 
-    vocab = sorted({s.lower() for s in (label_vocab or DEFAULT_LABELS)})
-    cameras = sorted({v for v in (camera_aliases or {}).values()})
-    system = (
-        "You convert a surveillance footage-search request into JSON. "
-        "Return ONLY a JSON object with keys: labels (array of object "
-        f"classes from this list: {vocab}), keywords (array of other "
-        "descriptive words like colors or clothing, matched against scene "
-        "captions), relative_time (one of: null, 'today', 'yesterday', "
-        "'this_morning', 'tonight', or an integer number of minutes for a "
-        "rolling window), camera (one of "
-        f"{cameras or ['null']} or null). No prose."
-    )
+    system = _llm_system_prompt(label_vocab, camera_aliases)
     try:
         resp = httpx.post(
             ollama_url.rstrip("/") + "/api/chat",
@@ -217,21 +241,55 @@ def parse_with_ollama(
         return parse_heuristic(
             query, now=now, label_vocab=label_vocab, camera_aliases=camera_aliases,
         )
+    return _filter_from_llm(data, now=now)
 
-    labels = [str(s).lower() for s in (data.get("labels") or []) if s]
-    labels = [_LABEL_ALIASES.get(s, s) for s in labels]
-    keywords = [str(s).lower() for s in (data.get("keywords") or []) if s]
-    camera_id = data.get("camera") or None
-    if camera_id in (None, "null"):
-        camera_id = None
 
-    since, until = _resolve_relative_time(data.get("relative_time"), now=now)
-    return QueryFilter(
-        labels=list(dict.fromkeys(labels)),
-        keywords=list(dict.fromkeys(keywords)),
-        since=since, until=until,
-        camera_id=str(camera_id) if camera_id else None,
-    )
+def parse_with_anthropic(
+    query: str,
+    *,
+    now: _dt.datetime,
+    model: str,
+    effort: str = "low",
+    label_vocab: Iterable[str] | None = None,
+    camera_aliases: dict[str, str] | None = None,
+    timeout_seconds: float = 20.0,
+    client: object | None = None,
+) -> QueryFilter:
+    """``parse_with_ollama`` on Claude. The key comes from the
+    ANTHROPIC_API_KEY env var; the SDK honours HTTPS_PROXY, which is how
+    a compose install reaches the API through the apps egress proxy.
+    Falls back to ``parse_heuristic`` on any error, logged — a missing
+    key or a denied egress should be findable, not just quietly worse."""
+    import json
+    import logging
+
+    system = _llm_system_prompt(label_vocab, camera_aliases)
+    try:
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic(timeout=timeout_seconds, max_retries=1)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            output_config={"effort": effort},
+            system=system,
+            messages=[{"role": "user", "content": query}],
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+        # Tolerate a ```json fence around the object.
+        text = text.removeprefix("```json").removeprefix("```").removesuffix("```")
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "anthropic query parse failed (%s: %s); using the heuristic parser",
+            type(exc).__name__, str(exc)[:200])
+        return parse_heuristic(
+            query, now=now, label_vocab=label_vocab, camera_aliases=camera_aliases,
+        )
+    return _filter_from_llm(data, now=now)
 
 
 def _resolve_relative_time(value: object, *, now: _dt.datetime):
