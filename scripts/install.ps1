@@ -739,7 +739,7 @@ function Choose-Example {
         # Ceiling = the tested envelope; never suggest past what this agent
         # has been exercised with. Speed ceiling too: a model that fits can
         # still be unusable, so CPU-only boxes are tiered by cores.
-        $capLlm = if ($accel -ne 'cpu') { 4 } elseif ($cores -ge 8) { 3 } elseif ($cores -ge 4) { 2 } else { 1 }
+        $capLlm = if ($accel -ne 'cpu') { 4 } elseif ($cores -ge 4) { 3 } else { 1 }   # 4+ cores: granite4:micro (measured; see install.sh)
         if ($capLlm -gt $budgetGb) { $capLlm = $budgetGb }
 
         # The catalog's speed column is editorial prose; this is the only
@@ -862,7 +862,7 @@ function Choose-Example {
             'moondream | blip | ollamavlm - all local.'
         if ((Get-EnvValue CAPTION_ADAPTER) -eq 'ollamavlm') {
             if ([string]::IsNullOrWhiteSpace($vlmSuggest)) { $vlmSuggest = $vlmIfChosen }
-            Explain 'Multimodal Ollama model the ollamavlm adapter uses for scene questions; the adapter auto-pulls it. gemma3:4b (tested - clearly better answers) is suggested where RAM allows; moondream is the tested low-RAM pick.' 'yes' $vlmSuggest
+            Explain 'Multimodal Ollama model the ollamavlm adapter uses for scene questions; the adapter auto-pulls it. qwen3-vl:2b-instruct (measured: no false yeses, the best counter) is suggested on an accelerator; moondream is the tested CPU pick.' 'yes' $vlmSuggest
             Set-EnvValue OLLAMA_VLM_MODEL (Pick-ModelFromCatalog 'vlm' $vlmSuggest 'Vision model (Ollama)' $budgetGb)
         }
 

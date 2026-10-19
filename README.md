@@ -4,7 +4,9 @@
 
 ### Your cameras. Your hardware. Your AI. Your audit.
 
-**OpenNVR is open-source video infrastructure for organisations and people who cannot hand their cameras to a vendor.** It records and streams like any NVR, puts any AI model you choose behind the cameras, ships ready-made applications, and lets you write your own — on hardware you own, air-gapped if you need, with every inference audited.
+**The open platform for AI on your cameras — new capabilities arrive as software, not new boxes.**
+
+OpenNVR is open-source video infrastructure for organisations and people who cannot hand their cameras to a vendor. It records and streams like any NVR, puts any AI model you choose behind the cameras, ships ready-made applications, and lets you write your own — on hardware you own, air-gapped if you need, with every inference audited.
 
 [![CI](https://github.com/open-nvr/open-nvr/actions/workflows/ci.yml/badge.svg)](https://github.com/open-nvr/open-nvr/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
@@ -17,6 +19,15 @@
 </div>
 
 ---
+
+## Why OpenNVR
+
+- **Any camera.** ONVIF and RTSP cameras from any vendor, an Android phone, or the machine's own webcam.
+- **Any AI model.** One open contract: swap the detector, add plate reading or a vision-language model, and nothing else changes.
+- **Local by default.** Recording, AI and the assistant run on your hardware. Cloud models are opt-in and audited.
+- **Ready for air-gapped sites, and for what still reaches them.** Runs fully offline, can keep the cameras on a network with no route out, and traces every alert to the model weights that produced it.
+- **Works with Home Assistant.** Cameras, zones and apps appear as devices through MQTT discovery, with nothing to install in Home Assistant.
+- **Build AI applications for your cameras.** Two Apache-2.0 SDKs: an app is your rule on the platform's events, an adapter is your model behind the contract. [Your first app](docs/FIRST_DETECTOR.md) · [your first adapter](https://github.com/open-nvr/ai-adapter#write-your-own-adapter).
 
 ## Get it running
 
@@ -61,10 +72,16 @@ Dashboard · Live view · Search · App Catalog · Vehicles (ANPR). The dark and
 
 ## What OpenNVR is
 
+**The NVR was built to record. Now recording is where it starts.**
+
+- An NVR's features are fixed the day you buy it. OpenNVR's arrive as apps and models, installed in one click on the same box.
+- An NVR's AI means the vendor's cloud or a new appliance. OpenNVR runs any model on your hardware.
+- An NVR asks you to trust the vendor. OpenNVR shows you the audit log, the model fingerprints and the evidence pack.
+
 Three things in one install, each usable on its own.
 
 1. **A complete NVR.** ONVIF and RTSP cameras in, recording and live view out, a detector always on. Works on day one with no AI configured at all.
-2. **An AI platform for cameras.** Any model behind a REST or WebSocket endpoint becomes a capability through a published contract. Object detection, plates, faces, pose, scene description, open-vocabulary search, tracking, speech in and out all ship. Thirteen installable applications sit on top: intrusion, loitering, occupancy, line crossing, plates, a doorbell that knows your family, a guard-scan check, a gate controller, an agent you can talk to.
+2. **An AI platform for cameras.** Any model behind a REST or WebSocket endpoint becomes a capability through a published contract. Object detection, plates, faces, pose, scene description, open-vocabulary search, tracking, speech in and out all ship. Twelve installable applications sit on top: intrusion, loitering, occupancy, line crossing, plates, a doorbell that knows your family, a guard-scan check, a gate controller, and an agent you can talk to.
 3. **A product you build on.** Two Apache-2.0 SDKs on PyPI. Write a server-side application or an adapter for your own model in an afternoon, run it on your own site, keep it private or publish it. The platform supplies cameras, streams, recording, detections, an event store with evidence, alerts, auth and audit. You supply the rule.
 
 ```bash
@@ -77,8 +94,9 @@ pip install opennvr-adapter-sdk    # write an adapter: your model as a first-cla
 Governments, defence, critical infrastructure, healthcare and schools share one constraint: the footage, the models and the decisions must stay inside the perimeter and be explainable afterwards. Most camera software is built the other way round, with the vendor's cloud holding the keys. OpenNVR is built for the constraint.
 
 - **Nothing leaves unless you open the door.** Two independent default-deny gates, `DEPLOYMENT_MODE=offline` and `AI_SOVEREIGNTY=local_only`, return HTTP 403 to every cloud route and every non-local model until an operator opts in. Apps reach the outside world only through an egress proxy on an allowlist an administrator approved.
-- **The camera network is isolated by architecture.** Cameras, the middleware gateway and the analytics layer are separate planes. Camera credentials are encrypted at rest. Video leaves the host only over RTSPS.
-- **Every inference is auditable.** One correlation id runs from the alert that fired, through the gateway that proxied it, to the model that answered. Model weights are fingerprinted and polled for drift. The audit log answers "why did this alert fire" without guesswork.
+- **Offline is one door, not all of them.** Air-gapped systems are still reached by USB sticks, contractor laptops, insiders, tampered models and plug-ins that phone home. Per-camera permissions, MFA and an append-only audit log answer the first three; fingerprinted models with declared permissions the fourth; a credential per app and an egress allowlist the last.
+- **The camera network can stay dark.** In dual-NIC mode, offered by `start.sh` and laid out in the [reference appliance](docs/REFERENCE_APPLIANCE.md), the cameras sit behind one network card with no gateway and no route out, and operators, the phone app, alerts and updates reach OpenNVR on the other. The installer can add a firewall rule that drops forwarding between the two. The management side can stay sealed or reach the internet for remote viewing over a VPN, phone alerts and updates; connecting it is a mode, not a downgrade, because the camera side stays exactly as dark and every default-deny gate stays on. Online, the box itself is what the internet can see, so keep it behind your firewall and never port-forward it. Camera credentials are encrypted at rest, and video leaves the host only over RTSPS.
+- **You can prove which model made every decision.** Every model registers with the SHA-256 of its weights, re-checked every minute: a change raises a critical alert and an audit entry, and a model that asks for a new permission stops serving until an operator approves it again. One correlation id runs from the alert, through the gateway, to the model and the exact weights that answered. A hash proves the weights did not change after you approved them, not that they were clean when you did; that is what declared permissions, the default-deny network policy and fine-tuning on your own footage are for.
 - **Procurement can check it.** A §889 covered-vendor self-check is built in. The architecture is a peer-citable paper ([DOI 10.5281/zenodo.22804254](https://doi.org/10.5281/zenodo.22804254)); this repository is its reference implementation.
 - **The sensitive part can stay sensitive.** Fine-tuned weights you cannot share, detection logic that is itself operationally sensitive, adapters under a classified licence: the Apache-2.0 SDK lets them run on the platform without ever being published.
 
@@ -87,6 +105,13 @@ The procurement brief is [`docs/GOVERNMENT_DEPLOYMENT.md`](docs/GOVERNMENT_DEPLO
 ## Buy the hardware once
 
 AI capability is arriving faster than any hardware refresh cycle. A camera system that needs a new appliance for each new capability will always be a generation behind. In OpenNVR a new capability is software.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="data/images/svg/opennvr-new-capability-dark.svg">
+  <img src="data/images/svg/opennvr-new-capability-light.svg" alt="A new capability is software, not a new box. A new model is released; it becomes an adapter on your existing OpenNVR box, where its weights are fingerprinted, its permissions declared and the local-only policy applied; an app in the App Catalog is installed and puts it to work; your people get the result as an alert on their phone. Recording runs the whole time, and a new appliance is crossed out." width="100%">
+</picture>
+
+A new model, an adapter, an app, an alert, on the box you already have. The fall-alert app is an illustration; the other tiles are apps that ship today.
 
 - **A new model is an adapter, not a device.** Swap the detector, add plate reading, add a vision-language model, upgrade to this month's weights: each is a container registered with the gateway, hot-swappable and fingerprint-tracked, on the box you already have.
 - **The always-on detector is deliberately cheap.** Tier-0 scans the camera's substream at a low frame rate and wakes the expensive models only when something is worth a closer look. That gate is why a mini-PC carries a whole site: the heavy models run on seconds of footage per hour, not all of it.
@@ -110,7 +135,7 @@ Detection using too much CPU is almost always video decode, not the model. Store
 - `opennvr-app new my-app`, edit one method, run the tests, point it at the stack. [Your first detector in 15 minutes](docs/FIRST_DETECTOR.md).
 - An adapter is about thirty lines around your model. [Write your own adapter](https://github.com/open-nvr/ai-adapter#write-your-own-adapter).
 - **Publishing is optional.** An app or adapter you write runs on your site with no obligation to list it anywhere. If you do list it in the App Catalog, you keep the copyright, your name is on the card, OpenNVR takes no fee, and you can sell what the code needs through the built-in licence hook. [The deal for developers](docs/DEVELOPER_PROGRAM.md).
-- **Fine-tune what ships.** Every reference model is a swap away from your own weights: point the adapter at your fine-tune, or train one and keep it private.
+- **Fine-tune what ships.** Every reference model is a swap away from your own weights: point the adapter at your fine-tune, or train one and keep it private. Not accurate enough on your site and no time to train? [We fine-tune it on your footage, on your hardware](mailto:contact@opennvr.org).
 
 ## How it fits together
 
@@ -148,9 +173,14 @@ The three-tier model, the wire contracts and the offline-first design are in [`d
 | [`footage-search`](examples/footage-search) | "Red truck at the dock yesterday" over recorded footage |
 | [`alert-notifier`](examples/alert-notifier) | What actually deserves to reach the guard's phone |
 | [`camera-agent`](examples/camera-agent) | Ask your cameras questions, by voice or text, all local |
-| [`home-assistant-relay`](examples/home-assistant-relay) | *Deprecated*: Home Assistant support is [built in](docs/HOME_ASSISTANT_USER_GUIDE.md); kept as a small NATS-to-MQTT bridge example |
 
-Fourteen of the sixteen shipped examples are listed above; [`inference-listener`](examples/inference-listener) and [`alerts-subscriber`](examples/alerts-subscriber) are minimal subscriber templates. Every app is a copy-as-template starting point. Replace the predicate and you have a purpose-built NVR for your domain. Gallery and roadmap: [`examples/README.md`](examples/README.md), [`docs/ROADMAP.md`](docs/ROADMAP.md).
+Thirteen of the sixteen shipped examples are listed above; [`inference-listener`](examples/inference-listener) and [`alerts-subscriber`](examples/alerts-subscriber) are minimal subscriber templates, and [`home-assistant-relay`](examples/home-assistant-relay) is kept only as a NATS-to-MQTT bridge example now that Home Assistant support is [built in](docs/HOME_ASSISTANT_USER_GUIDE.md). Every app is a copy-as-template starting point. Replace the predicate and you have a purpose-built NVR for your domain. Gallery and roadmap: [`examples/README.md`](examples/README.md), [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+## Works with Home Assistant
+
+Turn on MQTT discovery and OpenNVR appears in Home Assistant's own MQTT integration, with nothing to install there: one device for the server, one per camera, one per zone, and one per app that declares entities. You get motion, detection and recording switches, last object and last plate, object counts, PTZ buttons, the site mode as an alarm panel, and an event entity that fires on every detection and alert, ready for automations.
+
+Everything runs as an OpenNVR API token you choose. Home Assistant sees the cameras that token may see and can do only what it may do, and every command lands in the audit log. Setup is four steps: [the Home Assistant guide](docs/HOME_ASSISTANT_USER_GUIDE.md). The native integration, which adds live video, the media browser and phone notifications with the picture, installs from HACS: [hass-opennvr](https://github.com/open-nvr/hass-opennvr).
 
 ## Talk to your cameras
 

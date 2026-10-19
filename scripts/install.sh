@@ -498,9 +498,11 @@ catalog_pick() {
 suggest_models() {
     compute_model_budget
     local cap_llm
-    if [[ "$HW_ACCEL" != "cpu" ]]; then cap_llm=4        # GPU: up to qwen2.5:3b
-    elif (( HW_CORES >= 8 )); then      cap_llm=3        # strong CPU: qwen3:1.7b
-    elif (( HW_CORES >= 4 )); then      cap_llm=2        # modest CPU: qwen2.5:1.5b
+    if [[ "$HW_ACCEL" != "cpu" ]]; then cap_llm=4        # GPU: the default too; nothing tested sits above it
+    # 4+ cores: granite4:micro. Measured (MODELS_AND_LATENCY.md, "Measured
+    # again"): 44/60 on the Investigate step where qwen3:1.7b scored 21/60,
+    # because it looks before it decides; about twice the seconds a turn.
+    elif (( HW_CORES >= 4 )); then      cap_llm=3        # CPU: granite4:micro
     else                                cap_llm=1        # weak CPU: the tiny tier
     fi
     (( cap_llm > HW_MODEL_BUDGET_GB )) && cap_llm=$HW_MODEL_BUDGET_GB
@@ -1292,7 +1294,7 @@ choose_example() {
             # left): still preselect something real, sized to what is
             # left, so Enter never writes an empty model name.
             [[ -z "$vlm_suggest" ]] && vlm_suggest="$SUGGEST_VLM_IF_CHOSEN"
-            explain "Multimodal Ollama model the ollamavlm adapter uses for scene questions; the adapter auto-pulls it. gemma3:4b (tested — clearly better answers) is suggested where RAM allows; moondream is the tested low-RAM pick." \
+            explain "Multimodal Ollama model the ollamavlm adapter uses for scene questions; the adapter auto-pulls it. qwen3-vl:2b-instruct (measured: no false yeses, the best counter) is suggested on an accelerator; moondream is the tested CPU pick." \
                 "yes" "$vlm_suggest"
             pick_model_from_catalog vlm "$vlm_suggest" "Vision model (Ollama)"
             env_set OLLAMA_VLM_MODEL "$PICKED_MODEL"

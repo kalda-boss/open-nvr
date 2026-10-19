@@ -1305,6 +1305,9 @@ print_first_time_setup_token() {
         echo ""
         echo "$banner" | sed 's/^/  /'
         echo ""
+        echo -e "  ${GRAY}Rejected as missing or invalid? It may already be used — run${NC}"
+        echo -e "  ${GRAY}./start.sh restart and paste the fresh token it prints.${NC}"
+        echo ""
     else
         # Container healthy AND no banner = admin already activated
         # on a previous boot. Unambiguous now — give the operator the

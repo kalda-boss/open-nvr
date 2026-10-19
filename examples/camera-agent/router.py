@@ -142,6 +142,34 @@ def _should_force_grounding(user_text: str, reply: str) -> bool:
     return True
 
 
+# "more than 3 people", "over five cars", "fewer than 2 guards" — the count a
+# watch should alert on. Small models call create_monitor for these but drop
+# max_count (and then reply "watching for more than 3 people" over a watch
+# that will never alert), so the handler reads the number from the question.
+# Not a count when a time unit follows: "count cars over 10 minutes".
+_COUNT_NUM = (r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+              r"(?!\s*(?:s\b|secs?\b|seconds?\b|mins?\b|minutes?\b|hrs?\b|hours?\b"
+              r"|days?\b|am\b|pm\b|o'?clock\b|:|%))")
+_MAX_COUNT_RE = re.compile(
+    r"\b(?:more than|over|above|greater than|exceeds?|exceeding)\s+" + _COUNT_NUM + r"\b",
+    re.IGNORECASE)
+_MIN_COUNT_RE = re.compile(
+    r"\b(?:fewer than|less than|under|below)\s+" + _COUNT_NUM + r"\b", re.IGNORECASE)
+
+
+def _count_thresholds_from_text(text: str) -> dict[str, int]:
+    """``{"max_count": 3}`` for "tell me when more than 3 people gather";
+    ``{}`` when the question names no count."""
+    words = {**_NUMBER_WORDS, "ten": "10"}
+    out: dict[str, int] = {}
+    for key, rx in (("max_count", _MAX_COUNT_RE), ("min_count", _MIN_COUNT_RE)):
+        m = rx.search(text or "")
+        if m:
+            n = m.group(1).lower()
+            out[key] = int(words.get(n, n))
+    return out
+
+
 # Presence/count questions about concrete objects ("is anyone there?",
 # "how many cars?", "any people?") must be answered by the object DETECTOR
 # (yolov8), NOT a scene caption — BLIP describes the scene ("a table with a
@@ -556,7 +584,19 @@ def decide_tier0(text: str, *, cameras: list[str], advertised: set[str],
     """A tool call the agent can make without asking the model, or None."""
     t = (text or "").strip()
     words = re.findall(r"[A-Za-z']+", t)
-    if not t or not cameras:
+    if not t:
+        return None
+    # Small talk is a decision, not a question: a greeting, thanks, a
+    # closing or "what can you do" reaches the model with NO tools.
+    # Measured (MODELS_AND_LATENCY, "Measured"): told "always call a tool
+    # before describing", granite4:micro answered "thanks, that's all" with
+    # a three-tool sweep and "I can't see right now"; the guard only stops
+    # a fabricated sighting, not a look nobody asked for. Decided here,
+    # whatever the model, and before the camera check: a goodbye needs
+    # no camera.
+    if _is_small_talk(t):
+        return Decision(0, reason="small talk", hintable=False)
+    if not cameras:
         return None
     if len(words) > _MAX_WORDS or t.count("?") > 1:
         return Decision(2, reason="too long or two questions", hintable=False)
