@@ -118,6 +118,24 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Recordings no longer lose video or audio when a camera's clock drifts.**
+  Some cameras (seen on Uniview) stamp video at the nominal frame rate while
+  the encoder runs slightly faster or slower — 1663 ppm slow on one camera,
+  809 ppm fast on another — and MediaMTX aligned each track only once, when
+  the stream connected. Video and audio therefore drifted apart for as long
+  as the connection stayed up; past one second the recorder threw away the
+  lagging track ("sample of track N received too late, discarding"): after a
+  day, one camera kept 29% of its video and segments took 3.5 minutes to
+  close, and another recorded no audio at all. The recorded video was also
+  labelled up to 2.5 minutes earlier than it happened. MediaMTX is now built
+  from v1.15.4 source with a patch (`docker/mediamtx-build/patches`) that
+  keeps every track aligned with the audio track using the cameras' RTCP
+  sender reports, which carry the true timing. Audio is copied untouched,
+  the camera's own clock is never used for recording times, and streams
+  without sender reports behave as before. Building the image now downloads
+  the MediaMTX source and Go modules (checksum-verified) instead of copying
+  the official binary. Upstream report: bluenviron/mediamtx#6160.
+
 - **"Thanks" no longer makes the camera agent look at a camera.** When the
   model answered without calling a tool, the anti-fabrication guard forced a
   look if the model's reply mentioned the camera or the scene — so small

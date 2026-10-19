@@ -276,17 +276,27 @@ fi
 # FINAL base means curl AND its libs are correctly wired. We then
 # COPY only the mediamtx Go binary in (statically linked, no deps).
 # The contract being pinned: the LAST FROM in mediamtx's
-# dockerfile_inline must be `curlimages/curl:*`.
-start_test "mediamtx dockerfile_inline final base is curlimages/curl (libs wired)"
+# Dockerfile must be `curlimages/curl:*`.
+#
+# mediamtx is built from source with OpenNVR's patches since the RTCP
+# sender-report sync fix, so its Dockerfile moved from a
+# ``dockerfile_inline:`` block to docker/mediamtx-build/Dockerfile. The checks
+# below read whichever of the two the compose service uses.
+start_test "mediamtx Dockerfile final base is curlimages/curl (libs wired)"
 standard_inline=$(python3 - "${REPO_ROOT}" <<'PY'
-import sys, yaml
+import os, sys, yaml
 root = sys.argv[1]
 c = yaml.safe_load(open(root + "/docker-compose.yml"))
-print(c["services"]["mediamtx"]["build"]["dockerfile_inline"])
+build = c["services"]["mediamtx"]["build"]
+if build.get("dockerfile_inline"):
+    print(build["dockerfile_inline"])
+else:
+    print(open(os.path.join(root, build.get("context", "."), build.get("dockerfile", "Dockerfile"))).read())
 PY
 )
-# Extract the LAST FROM line — that's the final stage's base image.
-final_base=$(echo "$standard_inline" | grep -E "^[[:space:]]*FROM " | tail -1 | awk '{print $2}')
+# Extract the LAST FROM line — that's the final stage's base image
+# (skipping flags such as --platform=...).
+final_base=$(echo "$standard_inline" | grep -E "^[[:space:]]*FROM " | tail -1 | awk '{for (i = 2; i <= NF; i++) if ($i !~ /^--/) { print $i; exit }}')
 if echo "$final_base" | grep -qE "^curlimages/curl:"; then
     pass
 else
@@ -296,7 +306,7 @@ fi
 # ── 5a. negative contract: final stage is NOT plain alpine ──
 # Lock the inverse — anyone reverting to `FROM alpine:3.20` as the
 # final base regresses to the libcurl.so.4 missing bug.
-start_test "mediamtx dockerfile_inline final base is NOT plain alpine (libcurl.so.4 missing)"
+start_test "mediamtx Dockerfile final base is NOT plain alpine (libcurl.so.4 missing)"
 if echo "$final_base" | grep -qE "^alpine:"; then
     fail "mediamtx final stage must not be plain alpine — curl needs its libs"
 else
@@ -309,7 +319,7 @@ fi
 # /home/curl_user/mediamtx.yml — silent fallback to built-in
 # defaults, hardened YAML config ignored (RTSPS doesn't bind,
 # RTMP/SRT come up enabled, etc.). ISSUE-7 v5.
-start_test "mediamtx dockerfile_inline resets WORKDIR / after base switch"
+start_test "mediamtx Dockerfile resets WORKDIR / after base switch"
 if echo "$standard_inline" | grep -qE "^[[:space:]]*WORKDIR[[:space:]]+/[[:space:]]*$"; then
     pass
 else
@@ -317,7 +327,7 @@ else
 fi
 
 # ── 5c. USER root reset (mediamtx needs to bind listener ports) ──
-start_test "mediamtx dockerfile_inline resets USER root after base switch"
+start_test "mediamtx Dockerfile resets USER root after base switch"
 if echo "$standard_inline" | grep -qE "^[[:space:]]*USER[[:space:]]+root[[:space:]]*$"; then
     pass
 else
@@ -329,11 +339,25 @@ fi
 # directive (e.g. ["--help"]), it would be passed as args to our
 # ENTRYPOINT ["/mediamtx"], breaking the boot silently. We clear
 # it explicitly.
-start_test "mediamtx dockerfile_inline clears inherited CMD with CMD []"
+start_test "mediamtx Dockerfile clears inherited CMD with CMD []"
 if echo "$standard_inline" | grep -qE "^[[:space:]]*CMD[[:space:]]+\[\][[:space:]]*$"; then
     pass
 else
     fail "mediamtx Dockerfile must include 'CMD []' so inherited base-image CMD doesn't leak as args to mediamtx"
+fi
+
+# ── 5e. mediamtx source build is pinned ──
+# The image is built from the MediaMTX release source plus the patches in
+# docker/mediamtx-build/patches. The source tarball must be checksum-pinned and the
+# Go toolchain digest-pinned, so a build is reproducible and a tampered
+# download fails instead of shipping.
+start_test "mediamtx Dockerfile pins the source by sha256 and Go by digest"
+if echo "$standard_inline" | grep -qE "^[[:space:]]*ARG[[:space:]]+MEDIAMTX_SHA256=[0-9a-f]{64}[[:space:]]*$" \
+   && echo "$standard_inline" | grep -qE "sha256sum -c" \
+   && echo "$standard_inline" | grep -qE "^[[:space:]]*FROM[[:space:]].*golang:[0-9.]+[^@ ]*@sha256:[0-9a-f]{64}"; then
+    pass
+else
+    fail "mediamtx Dockerfile must pin MEDIAMTX_SHA256, verify it with sha256sum -c, and pin the golang image by digest"
 fi
 
 # ── 6. base images come from Docker Hub only (no external regs) ──
@@ -346,7 +370,7 @@ fi
 # new dependency operators may not be able to reach.
 start_test "every FROM in build inline uses Docker Hub or ghcr.io/open-nvr"
 disallowed=$(python3 - <<PY
-import yaml, re
+import os, yaml, re
 bad = []
 for fn in ("docker-compose.yml", "docker-compose.camera-agent.yml"):
     c = yaml.safe_load(open("${REPO_ROOT}/" + fn))
@@ -354,8 +378,11 @@ for fn in ("docker-compose.yml", "docker-compose.camera-agent.yml"):
         build = svc.get("build")
         if not isinstance(build, dict): continue
         inline = build.get("dockerfile_inline") or ""
+        # mediamtx is built from an external Dockerfile; audit it the same way.
+        if not inline and name == "mediamtx":
+            inline = open(os.path.join("${REPO_ROOT}", build.get("context", "."), build.get("dockerfile", "Dockerfile"))).read()
         for line in inline.splitlines():
-            m = re.match(r'^\s*FROM\s+(\S+)', line)
+            m = re.match(r'^\s*FROM\s+(?:--\S+\s+)*(\S+)', line)
             if not m: continue
             img = m.group(1)
             host = img.split("/")[0] if "/" in img else ""
