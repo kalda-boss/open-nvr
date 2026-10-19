@@ -19,6 +19,10 @@ dependencies = [
     "pydantic-settings>=2.1.0",
     "python-dotenv>=1.0.0",
     "nats-py>=2.6",
+    # Motion index (services/motion_index.py). The image already ships it as
+    # opencv-python-headless's dependency; declared so tests and the lock
+    # agree with what runs.
+    "numpy>=1.26",
     "python-jose>=3.3.0",
     "python-multipart>=0.0.6",
     "PyYAML>=6.0.3",

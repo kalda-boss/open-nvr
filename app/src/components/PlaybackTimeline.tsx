@@ -18,8 +18,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useEdgeAutoPan } from '../hooks/useEdgeAutoPan'
+import { MOTION_NOISE, motionPeak, type MotionTrack } from '../lib/motion'
 import { firstLocalTick } from '../lib/time'
 import { useTranslation, useDateFormat, type DateFormatters } from '../i18n'
+import { MotionLane } from './MotionLane'
 
 export interface TimelineSegment {
   /** epoch ms */
@@ -55,10 +57,21 @@ interface PlaybackTimelineProps {
   selection?: { inMs: number; outMs: number } | null
   /** Fired as the selection is painted (null while empty). */
   onSelectionChange?: (sel: { inMs: number; outMs: number } | null) => void
+  /** Per-second motion activity (lib/motion.ts), drawn as a lane above the
+   *  footage. It is part of the track: clicks, scrubs and zoom work on it. */
+  motion?: MotionTrack | null
+  /** Height (px) beyond the default the lanes may take (the player's pane
+   *  was dragged taller): all of it goes to the motion lane when there is
+   *  one, since that is where the detail is, else to the footage track. */
+  extraHeight?: number
   className?: string
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
+
+/** Default lane heights (px). */
+const MOTION_LANE_PX = 24
+const FOOTAGE_TRACK_PX = 36
 
 /** Pick a "nice" tick interval (ms) aiming for ~10 ticks across the span. */
 function pickTickInterval(spanMs: number): number {
@@ -105,6 +118,8 @@ export function PlaybackTimeline({
   mode = 'seek',
   selection,
   onSelectionChange,
+  motion = null,
+  extraHeight = 0,
   className = '',
 }: PlaybackTimelineProps) {
   const fmt = useDateFormat()
@@ -307,6 +322,14 @@ export function PlaybackTimeline({
   const currentPct = toPct(currentTime)
   const currentVisible = currentTime >= viewStart && currentTime <= viewEnd
   const hoverInGap = hoverMs != null && !inFootage(hoverMs)
+  // What the motion bar under the cursor says (same pixel's worth of time).
+  const hoverMotion = useMemo(() => {
+    if (!motion || hoverMs == null || hoverInGap) return null
+    const half = span / Math.max(1, trackRef.current?.clientWidth ?? 1) / 2
+    const { peak, pending } = motionPeak(motion, hoverMs - half, hoverMs + half + 1)
+    if (peak > MOTION_NOISE) return 'motion'
+    return pending ? 'pending' : null
+  }, [motion, hoverMs, hoverInGap, span])
 
   return (
     <div ref={wrapRef} className={`relative select-none ${className}`}>
@@ -324,11 +347,12 @@ export function PlaybackTimeline({
         )}
       </div>
 
-      {/* Track */}
+      {/* Track: the motion lane (when there is motion data) over the footage
+          lane — one pointer surface, so either one clicks, scrubs and zooms */}
       <div
         ref={trackRef}
         data-testid="playback-timeline-track"
-        className={`relative h-9 bg-[var(--panel-2)] overflow-hidden rounded-sm touch-none ${
+        className={`relative overflow-hidden rounded-sm touch-none ${
           mode === 'clip' ? 'cursor-crosshair' : 'cursor-pointer'
         }`}
         onPointerDown={handleDown}
@@ -337,31 +361,58 @@ export function PlaybackTimeline({
         onPointerLeave={handleLeave}
         onPointerCancel={handleCancel}
       >
-        {/* Footage (accent blue) */}
-        {blocks.map((b, i) => (
-          <div
-            key={i}
-            data-testid="playback-footage-block"
-            className="absolute top-0 bottom-0"
-            style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--accent)' }}
+        {motion && (
+          <MotionLane
+            track={motion}
+            viewStart={viewStart}
+            viewEnd={viewEnd}
+            data-testid="playback-motion-lane"
+            role="img"
+            aria-label={t('playback.motionLane')}
+            className="block w-full bg-[var(--panel)]"
+            style={{ height: MOTION_LANE_PX + extraHeight }}
           />
-        ))}
+        )}
 
-        {/* LIVE zone (green, still recording — plays via Live View) */}
-        {liveBlocks.map((b, i) => (
-          <div
-            key={`live-${i}`}
-            className="absolute top-0 bottom-0 flex items-center overflow-hidden"
-            style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--ok)' }}
-          >
-            {b.width > 4 && (
-              <span className="ml-1 flex items-center gap-1 text-[9px] font-semibold text-white/90 whitespace-nowrap">
-                <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" />
-                LIVE
-              </span>
-            )}
-          </div>
-        ))}
+        <div
+          className="relative bg-[var(--panel-2)]"
+          style={{ height: FOOTAGE_TRACK_PX + (motion ? 0 : extraHeight) }}
+        >
+          {/* Footage (accent blue) */}
+          {blocks.map((b, i) => (
+            <div
+              key={i}
+              data-testid="playback-footage-block"
+              className="absolute top-0 bottom-0"
+              style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--accent)' }}
+            />
+          ))}
+
+          {/* LIVE zone (green, still recording — plays via Live View) */}
+          {liveBlocks.map((b, i) => (
+            <div
+              key={`live-${i}`}
+              className="absolute top-0 bottom-0 flex items-center overflow-hidden"
+              style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--ok)' }}
+            >
+              {b.width > 4 && (
+                <span className="ml-1 flex items-center gap-1 text-[9px] font-semibold text-white/90 whitespace-nowrap">
+                  <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" />
+                  LIVE
+                </span>
+              )}
+            </div>
+          ))}
+
+          {/* Ticks */}
+          {ticks.map((t, i) => (
+            <div
+              key={i}
+              className="absolute top-0 h-2 w-px bg-white/25 pointer-events-none"
+              style={{ left: `${t.pct}%` }}
+            />
+          ))}
+        </div>
 
         {/* Clip selection band */}
         {selection && selection.outMs > selection.inMs && (
@@ -373,15 +424,6 @@ export function PlaybackTimeline({
             }}
           />
         )}
-
-        {/* Ticks */}
-        {ticks.map((t, i) => (
-          <div
-            key={i}
-            className="absolute top-0 h-2 w-px bg-white/25 pointer-events-none"
-            style={{ left: `${t.pct}%` }}
-          />
-        ))}
 
         {/* Hover guide */}
         {hoverMs != null && (
@@ -423,6 +465,12 @@ export function PlaybackTimeline({
         >
           {fmtFull(hoverMs, fmt)}
           {hoverInGap && <span className="text-[var(--warn)] ml-1">· {t('shared.noRecordingLower')}</span>}
+          {hoverMotion === 'motion' && (
+            <span className="text-[var(--motion)] ml-1">· {t('playback.motionHere')}</span>
+          )}
+          {hoverMotion === 'pending' && (
+            <span className="text-white/60 ml-1">· {t('playback.motionScoring')}</span>
+          )}
         </div>
       )}
     </div>

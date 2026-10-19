@@ -639,6 +639,18 @@ async def lifespan(app: FastAPI):
     spawn_background(background_recording_reconciler(),
                      name="recording-reconciler")
 
+    # Motion index: scores each recorded clip's motion from its keyframes
+    # (the playback timeline's motion bar), newest first, then backfills.
+    async def background_motion_index():
+        async def _loop():
+            from services.motion_index import run_motion_index_loop
+
+            await run_motion_index_loop()
+
+        await run_consumer_forever("Motion index", _loop)
+
+    spawn_background(background_motion_index(), name="motion-index")
+
     # RFC-0002 Phase 0: consume plate.recognized.v1 from the bus and write
     # plate_text onto timeline rows — producer-independent (EVENT_CONTRACTS.md
     # convergence). No NATS_URL / no nats-py degrades to the enrichment

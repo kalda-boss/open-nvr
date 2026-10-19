@@ -713,6 +713,10 @@ services:
       - RECORDINGS_HOST_BASE=${RECORDINGS_PATH:-./recordings}
       - RECORDINGS_CONTAINER_BASE=/app/recordings
       - RECORDINGS_BASE_PATH=/app/recordings
+      # Motion bar on the playback timeline: background scoring of every
+      # recorded clip (services/motion_index.py). Unset = on, 2 workers.
+      - MOTION_INDEX_ENABLED=${MOTION_INDEX_ENABLED:-}
+      - MOTION_INDEX_WORKERS=${MOTION_INDEX_WORKERS:-}
       - SECRET_KEY=${SECRET_KEY}
       - CREDENTIAL_ENCRYPTION_KEY=${CREDENTIAL_ENCRYPTION_KEY}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}

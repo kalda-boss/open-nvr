@@ -59,6 +59,21 @@ export const recordingService = {
     }
     return api.get(`/api/v1/recordings/segments/${cameraId}`, { params })
   },
+  // Per-second motion activity over the same local day as getSegments (the
+  // timeline's motion bar). `focusMs` — where the viewer is — tells the
+  // server which unscored clips to score first.
+  getMotion: (cameraId: number, date: string, focusMs?: number) => {
+    const params: Record<string, string> = {
+      tz: browserTz(),
+      date,
+      start: new Date(localDayStart(date)).toISOString(),
+      end: new Date(localDayEnd(date)).toISOString(),
+    }
+    if (focusMs != null && Number.isFinite(focusMs)) {
+      params.focus = new Date(focusMs).toISOString()
+    }
+    return api.get(`/api/v1/recordings/motion/${cameraId}`, { params })
+  },
 
   // HLS VOD
   createHlsPlaybackSession: (params: { camera_id: number; start: string; end: string }) => {

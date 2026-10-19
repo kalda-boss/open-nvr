@@ -34,6 +34,10 @@
   --series-1: #3987e5;    /* blue   */
   --series-2: #d95926;    /* orange */
   --series-3: #199e70;    /* aqua   */
+  /* The playback timeline's motion bar. Orange, apart from the footage
+     (--accent), the LIVE zone (--ok) and a clip selection (--warn). Follows
+     the light theme through --series-2. */
+  --motion: var(--series-2);
   /* Aliases for names some views reached for that were never defined. An
      undefined var() with no fallback resolves to nothing (Cameras' --muted
      text, Updates' --bg-sub), and one with a hex fallback ignores the light

@@ -36,6 +36,9 @@ import {
   Scissors,
   Download,
   Radio,
+  Activity,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react'
 import { apiService } from '../lib/apiService'
 import { displayAspect, isStretched } from '../lib/aspect'
@@ -46,8 +49,21 @@ import type { FisheyeLens } from '../lib/fisheye'
 import { AspectFrame, DewarpMenu, FisheyeView } from './VideoPlayer'
 import type { FisheyeViewHandle } from './VideoPlayer'
 import { loadHls, warmHls } from '../lib/loadHls'
-import { useCameraSegments } from '../lib/queries'
+import {
+  MOTION_PRE_ROLL_MS,
+  motionEvents,
+  nextMotionEvent,
+  parseMotion,
+  prevMotionEvent,
+  skipQuietTarget,
+} from '../lib/motion'
+import { useCameraMotion, useCameraSegments } from '../lib/queries'
 import { localDayEnd, localDayStart } from '../lib/time'
+import { useTranslation } from '../i18n'
+import { useSnackbar } from './Snackbar'
+import { PaneResizer } from './PaneResizer'
+import { useElementSize } from '../hooks/useElementSize'
+import { usePaneExtra } from '../hooks/usePaneExtra'
 import { PlaybackTimeline, type TimelineSegment } from './PlaybackTimeline'
 
 interface RawSegment {
@@ -88,6 +104,8 @@ const ZOOMS: { label: string; span: number }[] = [
 ]
 
 const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16]
+/** Least height the video keeps when the timeline pane is dragged taller. */
+const MIN_VIDEO_PX = 140
 const RATE_1X = 2 // index of 1x in SPEEDS
 const FRAME_STEP = 1 / 25 // ~1 frame at 25fps
 
@@ -163,8 +181,20 @@ export function PlaybackConsole({
   const liveEdgeRef = useRef<number | null>(null)
 
   const navigate = useNavigate()
+  const { t } = useTranslation()
+  const { showInfo } = useSnackbar()
+
+  // ---- Resizable bottom pane ---------------------------------------------
+  // Dragging the pane's top edge up gives the timeline height the video
+  // gives up: out of its 16:9 height in the window, out of what the column
+  // leaves it in fullscreen.
+  const [videoBoxRef, videoBox] = useElementSize<HTMLDivElement>()
+  const [paneExtra, setPaneExtra] = usePaneExtra('opennvr.playback.timelineExtra')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // A clip that will not play. Shown over the video only: the timeline (and
+  // the motion bar on it) stays usable, and the next seek tries again.
+  const [clipError, setClipError] = useState<string | null>(null)
   const [segs, setSegs] = useState<Seg[]>([])
   const [liveEdgeMs, setLiveEdgeMs] = useState<number | null>(null)
   // Shown when the user (or auto-advance) reaches the live zone.
@@ -186,6 +216,14 @@ export function PlaybackConsole({
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [buffering, setBuffering] = useState(false)
 
+  // Skip-quiet playback: while playing, jump over stretches scored quiet.
+  const [skipQuiet, setSkipQuiet] = useState(false)
+  // Where (and when) the last skip went. Until playback arrives, a stale
+  // position must not start another skip.
+  const skipTargetRef = useRef<{ ms: number; at: number } | null>(null)
+  // "No more activity" is said once per skip-quiet session.
+  const skipEndSaidRef = useRef(false)
+
   // Clip-export state.
   const [clipMode, setClipMode] = useState(false)
   const [selection, setSelection] = useState<{ inMs: number; outMs: number } | null>(null)
@@ -195,6 +233,13 @@ export function PlaybackConsole({
     () => segs.map((s) => ({ startMs: s.startMs, endMs: s.endMs })),
     [segs]
   )
+
+  // ---- Motion activity (the timeline's motion bar) --------------------------
+  // The playhead rides along so the server scores the clips around it first
+  // (none until the day has loaded and placed it).
+  const motionQuery = useCameraMotion(cameraId, date, previewMs ?? (currentMs || undefined))
+  const motion = useMemo(() => parseMotion(motionQuery.data), [motionQuery.data])
+  const activity = useMemo(() => motionEvents(motion), [motion])
 
   // ---- Load the day's segments (react-query; polls today at 10s) -----------
   // Polling only runs while `date` is the local today (footage still being
@@ -292,6 +337,7 @@ export function PlaybackConsole({
         return
       }
       const token = ++loadTokenRef.current
+      setClipError(null)
 
       teardownHls()
 
@@ -341,7 +387,7 @@ export function PlaybackConsole({
       } catch {
         if (token === loadTokenRef.current) {
           setBuffering(false)
-          setError('Failed to start playback for this clip.')
+          setClipError('Failed to start playback for this clip.')
         }
         return
       }
@@ -419,7 +465,7 @@ export function PlaybackConsole({
           () => {
             if (token === loadTokenRef.current) {
               setBuffering(false)
-              setError('Failed to play this recording.')
+              setClipError('Failed to play this recording.')
             }
           },
           { once: true }
@@ -447,7 +493,7 @@ export function PlaybackConsole({
         el.addEventListener('loadedmetadata', startAtOffset, { once: true })
       } else {
         setBuffering(false)
-        setError('HLS is not supported in this browser.')
+        setClipError('HLS is not supported in this browser.')
       }
     },
     [cameraId, rateIdx, muted, teardownHls]
@@ -584,6 +630,41 @@ export function PlaybackConsole({
     if (clip) loadClip(clip, Math.max(0, (ms - clip.startMs) / 1000), isPlaying)
   }
 
+  // Jump to the next / previous stretch of motion, with a short lead-in.
+  const jumpToActivity = (dir: 1 | -1) => {
+    const at = previewMs ?? currentMs
+    const ev = dir > 0 ? nextMotionEvent(activity, at) : prevMotionEvent(activity, at)
+    if (!ev) {
+      showInfo(t(dir > 0 ? 'playback.noActivityAfter' : 'playback.noActivityBefore'))
+      return
+    }
+    seekTo(Math.max(dayStart, ev.startMs - MOTION_PRE_ROLL_MS))
+  }
+
+  // Skip-quiet: once playback leaves a stretch of motion (plus a short
+  // tail), go to the next one. Footage not scored yet is never skipped.
+  // Not while buffering: during a cross-clip load the old clip keeps
+  // reporting times mapped onto the new one, which would skip again.
+  useEffect(() => {
+    if (!skipQuiet || !isPlaying || buffering || !motion || previewMs != null || livePrompt) return
+    const last = skipTargetRef.current
+    if (last && Date.now() - last.at < 8000 && currentMs < last.ms - 1000) return
+    skipTargetRef.current = null
+    const target = skipQuietTarget(motion, activity, currentMs)
+    if (target === 'end') {
+      if (!skipEndSaidRef.current) {
+        skipEndSaidRef.current = true
+        showInfo(t('playback.noActivityAfter'))
+      }
+      return
+    }
+    if (target == null) return
+    skipTargetRef.current = { ms: target, at: Date.now() }
+    seekTo(target)
+    // seekTo is recreated every render; the inputs above decide when to run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skipQuiet, isPlaying, buffering, motion, activity, currentMs, previewMs, livePrompt])
+
   const stepFrame = (dir: 1 | -1) => {
     const el = videoRef.current
     if (!el) return
@@ -705,6 +786,14 @@ export function PlaybackConsole({
 
   const effectiveCurrent = previewMs ?? currentMs
 
+  // In fullscreen the measured box already excludes the extra it gave up
+  // last render, so add that back to get the column's room.
+  const appliedExtraRef = useRef(0)
+  const videoRoom =
+    (isFullscreen ? videoBox.h + appliedExtraRef.current : (videoBox.w * 9) / 16) - MIN_VIDEO_PX
+  const paneExtraPx = Math.max(0, Math.min(paneExtra, videoRoom))
+  appliedExtraRef.current = paneExtraPx
+
   return (
     <div
       className={`fixed inset-0 bg-black/85 flex items-center justify-center z-50 ${
@@ -737,13 +826,20 @@ export function PlaybackConsole({
 
         {/* Video */}
         {/* Size container so AspectFrame's 100cqw resolves to this box's width.
-            Both branches have a definite height — aspect-video derives one from
-            the width, flex-1 min-h-0 takes one from the column. */}
+            Every branch has a definite height — aspect-video derives one from
+            the width, flex-1 min-h-0 takes one from the column, and with the
+            timeline pane dragged taller it is 16:9 less what the pane took. */}
         <div
+          ref={videoBoxRef}
           className={`relative bg-black flex items-center justify-center ${
-            isFullscreen ? 'flex-1 min-h-0' : 'aspect-video'
+            isFullscreen ? 'flex-1 min-h-0' : paneExtraPx > 0 ? '' : 'aspect-video'
           }`}
-          style={{ containerType: 'size' }}
+          style={{
+            containerType: 'size',
+            ...(!isFullscreen && paneExtraPx > 0
+              ? { height: (videoBox.w * 9) / 16 - paneExtraPx }
+              : {}),
+          }}
         >
           {error ? (
             <div className="text-center p-8">
@@ -774,7 +870,15 @@ export function PlaybackConsole({
                   />
                 )}
               </AspectFrame>
-              {(loading || buffering) && !livePrompt && (
+              {clipError && !livePrompt && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/70 pointer-events-none">
+                  <div className="text-center p-8">
+                    <AlertCircle size={48} className="mx-auto mb-3 text-[var(--on-video-warn)] opacity-70" />
+                    <p className="text-[var(--on-video)] text-sm">{clipError}</p>
+                  </div>
+                </div>
+              )}
+              {(loading || buffering) && !livePrompt && !clipError && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/30 pointer-events-none">
                   <Loader2 size={40} className="animate-spin text-[var(--accent)]" />
                 </div>
@@ -814,9 +918,18 @@ export function PlaybackConsole({
           )}
         </div>
 
-        {/* Toolbar */}
+        {/* Toolbar (wraps on a phone rather than pushing the zoom presets off).
+            Its top edge is the bottom pane's: drag it up for a taller timeline. */}
         {!error && (
-          <div className="shrink-0 flex items-center gap-1 px-3 py-2 bg-[var(--panel-2)] border-t border-[var(--border)]">
+          <div className="relative shrink-0 flex flex-wrap items-center gap-1 px-3 py-2 bg-[var(--panel-2)] border-t border-[var(--border)]">
+            {segs.length > 0 && (
+              <PaneResizer
+                value={paneExtraPx}
+                onChange={setPaneExtra}
+                max={() => videoRoom}
+                label={t('playback.resizeTimeline')}
+              />
+            )}
             <IconBtn title="Previous frame" onClick={() => stepFrame(-1)}>
               <SkipBack size={16} />
             </IconBtn>
@@ -854,6 +967,44 @@ export function PlaybackConsole({
             >
               <Scissors size={16} />
             </button>
+
+            {motion && (
+              <div className="mx-1 flex items-center">
+                <IconBtn title={t('playback.prevActivity')} onClick={() => jumpToActivity(-1)}>
+                  <ChevronLeft size={16} />
+                </IconBtn>
+                <button
+                  title={t(skipQuiet ? 'playback.skipQuietOn' : 'playback.skipQuiet')}
+                  aria-pressed={skipQuiet}
+                  onClick={() => {
+                    skipTargetRef.current = null
+                    skipEndSaidRef.current = false
+                    setSkipQuiet((on) => !on)
+                  }}
+                  className={`p-1.5 rounded transition-colors ${
+                    skipQuiet
+                      ? 'bg-[var(--motion)] text-white'
+                      : 'text-[var(--motion)] hover:bg-[var(--panel)]'
+                  }`}
+                >
+                  <Activity size={16} />
+                </button>
+                <IconBtn title={t('playback.nextActivity')} onClick={() => jumpToActivity(1)}>
+                  <ChevronRight size={16} />
+                </IconBtn>
+                {motion.pending > 0 && (
+                  <span
+                    className="ml-1 flex items-center gap-1 text-[11px] font-mono tabular-nums text-[var(--text-dim)]"
+                    title={t('playback.motionScoringProgress', {
+                      percent: String(Math.floor(motion.progress * 100)),
+                    })}
+                  >
+                    <Loader2 size={12} className="animate-spin" />
+                    {Math.floor(motion.progress * 100)}%
+                  </span>
+                )}
+              </div>
+            )}
 
             {dewarp.modes.length > 0 && (
               <DewarpMenu
@@ -937,6 +1088,8 @@ export function PlaybackConsole({
               mode={clipMode ? 'clip' : 'seek'}
               selection={clipMode ? selection : null}
               onSelectionChange={setSelection}
+              motion={motion}
+              extraHeight={paneExtraPx}
             />
           </div>
         )}

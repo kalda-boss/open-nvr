@@ -84,6 +84,8 @@ The playback page lists recorded segments for a date range you pick, with filter
 
 Click a segment to play it. The scrubber respects the seek window the recording was indexed with; for finer-grained seeking on long recordings, zoom the scrubber via the magnifier icon.
 
+The orange **motion bar** along the timeline shows when something moved in the frame. **‹ / ›** jump to the previous / next stretch of motion. The pulse button between them skips quiet stretches while playing; at 4x–8x that skims a day. Drag the top edge of the controls bar up to make the timeline taller (double-click it to reset). See [docs/MOTION_TIMELINE.md](docs/MOTION_TIMELINE.md).
+
 Export is via the **⋯** menu on a segment row → **Download MP4**. Exports
 are remuxed (not re-encoded) so they preserve original quality.
 

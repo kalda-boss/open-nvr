@@ -1587,6 +1587,39 @@ async def get_playback_config(
     }
 
 
+def _day_window(
+    date: str | None, start: str | None, end: str | None, tz: str | None
+) -> tuple[str, datetime, datetime]:
+    """The ``[start, end)`` window a DVR-timeline endpoint serves.
+
+    Explicit ISO instants win; otherwise the LOCAL day ``date`` (default
+    today) in ``tz``. Returns ``(date, start_utc, end_utc)``; an instant
+    without an offset is taken as UTC.
+    """
+    from services.recording_query_service import local_day_bounds, resolve_query_tz
+
+    query_tz = resolve_query_tz(tz)
+    range_start: datetime | None = None
+    range_end: datetime | None = None
+    if start and end:
+        try:
+            range_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            range_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start/end format")
+        if range_start.tzinfo is None:
+            range_start = range_start.replace(tzinfo=UTC)
+        if range_end.tzinfo is None:
+            range_end = range_end.replace(tzinfo=UTC)
+    target_date = date or datetime.now(query_tz).strftime("%Y-%m-%d")
+    if range_start is None or range_end is None:
+        try:
+            range_start, range_end = local_day_bounds(target_date, query_tz)
+        except (ValueError, IndexError):
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    return target_date, range_start, range_end
+
+
 @router.get("/segments/{camera_id}")
 async def get_day_segments(
     camera_id: int,
@@ -1634,30 +1667,9 @@ async def get_day_segments(
         raise HTTPException(status_code=404, detail="Camera not found")
     _require_camera_view(user_obj, camera, db)
 
-    from services.recording_query_service import (
-        camera_has_rows,
-        day_segments,
-        local_day_bounds,
-        resolve_query_tz,
-    )
+    from services.recording_query_service import camera_has_rows, day_segments
 
-    query_tz = resolve_query_tz(tz)
-
-    # Resolve the requested window: explicit instants win, else the LOCAL day.
-    range_start: datetime | None = None
-    range_end: datetime | None = None
-    if start and end:
-        try:
-            range_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            range_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid start/end format")
-    target_date = date or datetime.now(query_tz).strftime("%Y-%m-%d")
-    if range_start is None or range_end is None:
-        try:
-            range_start, range_end = local_day_bounds(target_date, query_tz)
-        except (ValueError, IndexError):
-            raise HTTPException(status_code=400, detail="Invalid date format")
+    target_date, range_start, range_end = _day_window(date, start, end, tz)
 
     path = _build_stream_name(
         settings.mediamtx_stream_prefix, camera.id, camera.ip_address
@@ -1794,6 +1806,85 @@ async def get_day_segments(
             f"Failed to get day segments for camera {camera_id}: {e}"
         )
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/motion/{camera_id}")
+async def get_day_motion(
+    camera_id: int,
+    date: str | None = Query(
+        default=None,
+        description="Day in YYYY-MM-DD (interpreted in `tz`). Defaults to today.",
+    ),
+    start: str | None = Query(
+        default=None, description="Explicit range start (ISO 8601), overrides date"
+    ),
+    end: str | None = Query(
+        default=None, description="Explicit range end (ISO 8601), overrides date"
+    ),
+    tz: str | None = Query(
+        default=None,
+        description="IANA timezone for interpreting `date` (default: server local)",
+    ),
+    focus: str | None = Query(
+        default=None,
+        description="ISO instant the viewer is at: unscored clips nearest it "
+        "are scored first",
+    ),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Per-second motion activity for a camera over the same window as
+    ``/segments`` — the playback timeline's motion bar.
+
+    ``values`` is base64, one byte per second from ``start``: ``0``-``253`` is
+    the recorded clip's motion score (``round(255 * sqrt(changed fraction))``,
+    see services/motion_index.py), ``254`` a recorded second not scored yet,
+    ``255`` no footage. While ``pending`` clips remain, the window goes to the
+    front of the indexer's queue, nearest ``focus`` first.
+    """
+    import base64
+
+    from services.motion_index import day_motion, prioritize
+
+    user_obj = await _authenticate_request(request, db)
+    if not user_obj:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Same visibility as /segments: paused and binned cameras' history too.
+    camera = db.query(Camera).filter(Camera.id == camera_id).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    _require_camera_view(user_obj, camera, db)
+
+    target_date, range_start, range_end = _day_window(date, start, end, tz)
+    # One byte per second: a DST day is 25 h, so allow two days and no more.
+    if not timedelta(0) < range_end - range_start <= timedelta(hours=49):
+        raise HTTPException(status_code=400, detail="Invalid motion window")
+
+    focus_at: datetime | None = None
+    if focus:
+        try:
+            focus_at = datetime.fromisoformat(focus.replace("Z", "+00:00"))
+            if focus_at.tzinfo is None:
+                focus_at = focus_at.replace(tzinfo=UTC)
+        except ValueError:
+            focus_at = None
+
+    result = await asyncio.to_thread(day_motion, db, camera_id, range_start, range_end)
+    if result["pending"] and settings.motion_index_enabled:
+        prioritize(camera_id, range_start, range_end, focus_at)
+
+    return {
+        "camera_id": camera_id,
+        "date": target_date,
+        "start": range_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "step": 1,
+        "values": base64.b64encode(result["values"]).decode("ascii"),
+        "scored": result["scored"],
+        "pending": result["pending"],
+        "enabled": settings.motion_index_enabled,
+    }
 
 
 # =============================================================================
