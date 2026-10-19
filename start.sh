@@ -1520,6 +1520,13 @@ case "$COMMAND" in
     docker compose $ARGS ps
     ;;
 
+  compose-args)
+    # The -f/--profile arguments every command here runs Compose with, for
+    # scripts that must see the stack exactly as `up` will: scripts/deploy.sh
+    # checks with them whether an update would recreate the recorder.
+    compose_args
+    ;;
+
   validate)
     print_banner
     run_validate
@@ -1602,7 +1609,7 @@ case "$COMMAND" in
 
   *)
     echo -e "${RED}Unknown command: $COMMAND${NC}"
-    echo "Usage: ./start.sh [start|restart|up|build|down|logs|status|validate|token|refresh-net|install|reconfigure|refresh-certs]"
+    echo "Usage: ./start.sh [start|restart|up|build|down|logs|status|validate|token|refresh-net|install|reconfigure|refresh-certs|compose-args]"
     exit 1
     ;;
 esac
