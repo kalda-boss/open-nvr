@@ -1,0 +1,1067 @@
+From 5a882d6ecac2364c334daae695dea588daa3cf89 Mon Sep 17 00:00:00 2001
+From: OpenNVR <opennvr@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 18:10:10 -0500
+Subject: [PATCH] rtsp: synchronize tracks with RTCP sender reports
+
+The RTP time decoder aligns tracks once, when their first packet arrives,
+and then advances every track with its own RTP clock. Many IP cameras
+(observed on Uniview) generate video RTP timestamps from the nominal frame
+rate (i.e. 9000 ticks per frame at 10fps) while the encoder actually runs
+slightly faster or slower (-1663 ppm and +809 ppm measured), so video and
+audio drift apart by seconds per hour. Once the drift exceeds 1s, the
+recorder discards the lagging track ("sample of track N received too
+late, discarding") and labels footage with a growing time shift
+(see https://github.com/bluenviron/mediamtx/issues/6160).
+
+Cameras declare the true relation between RTP timestamps and their
+clock in RTCP sender reports. Use them to keep every track of a RTSP
+session (static sources and publishers) aligned with a reference track
+(the first audio track):
+
+- the camera clock is only used to compute differences between tracks;
+  it is never exposed, so session and recording times keep coming from
+  the server clock;
+- the reference track is never modified;
+- before sender reports are available, or when they are never sent,
+  timestamps are the ones of the RTP time decoder, as before;
+- the offset between a track and the reference is estimated with a
+  robust (Theil-Sen) line fit over 5 minutes, which filters the +-30ms
+  quantization noise of sender reports and allows to extrapolate when
+  reports go missing; drift up to 5% is followed;
+- sudden jumps (i.e. a camera clock step seen by one track before the
+  other) are ignored unless they persist for 30s;
+- the correction changes by at most 10% of the elapsed media time and
+  only when a track moves forward, so timestamps stay monotonic
+  (B-frames too);
+- the correction is kept within 500ms of the alignment given by arrival
+  times, so tracks are never delivered with a skew the recorder can't
+  handle, even if sender reports are wrong.
+---
+ internal/protocols/rtsp/to_stream.go       |   9 +
+ internal/protocols/rtsp/track_sync.go      | 446 +++++++++++++++++
+ internal/protocols/rtsp/track_sync_test.go | 529 +++++++++++++++++++++
+ 3 files changed, 984 insertions(+)
+ create mode 100644 internal/protocols/rtsp/track_sync.go
+ create mode 100644 internal/protocols/rtsp/track_sync_test.go
+
+diff --git a/internal/protocols/rtsp/to_stream.go b/internal/protocols/rtsp/to_stream.go
+index bbf277e..b7ad590 100644
+--- a/internal/protocols/rtsp/to_stream.go
++++ b/internal/protocols/rtsp/to_stream.go
+@@ -35,10 +35,14 @@ func ToStream(
+ 	strm *stream.Stream,
+ 	log logger.Writer,
+ ) {
++	ts := &trackSync{log: log}
++	ts.initialize(medias)
++
+ 	for _, medi := range medias {
+ 		for _, forma := range medi.Formats {
+ 			cmedi := medi
+ 			cforma := forma
++			ctrack := ts.track(forma)
+ 
+ 			var ntpStat ntpState
+ 
+@@ -77,6 +81,11 @@ func ToStream(
+ 					return
+ 				}
+ 
++				if ctrack != nil {
++					srNTP, srOK := source.PacketNTP(cmedi, pkt)
++					pts = ctrack.process(pts, srNTP, srOK)
++				}
++
+ 				ntp, ok := handleNTP(pkt)
+ 				if !ok {
+ 					return
+diff --git a/internal/protocols/rtsp/track_sync.go b/internal/protocols/rtsp/track_sync.go
+new file mode 100644
+index 0000000..bc218b0
+--- /dev/null
++++ b/internal/protocols/rtsp/track_sync.go
+@@ -0,0 +1,446 @@
++package rtsp
++
++import (
++	"math"
++	"slices"
++	"sync"
++	"time"
++
++	"github.com/bluenviron/gortsplib/v5/pkg/description"
++	"github.com/bluenviron/gortsplib/v5/pkg/format"
++
++	"github.com/bluenviron/mediamtx/internal/logger"
++)
++
++// The RTP time decoder aligns tracks once, when their first packet arrives,
++// and then advances every track with its own RTP clock. Many cameras generate
++// video RTP timestamps from the nominal frame rate (i.e. 9000 ticks per frame at 10fps)
++// while the encoder runs slightly faster or slower than that, so video drifts away
++// from audio by up to several seconds per hour. Since cameras declare the true
++// relation between RTP timestamps and their own clock in RTCP sender reports,
++// trackSync uses them to keep every track aligned to a reference track (the first audio track).
++//
++// The camera clock is only used to compute differences between tracks and is never
++// exposed. The reference track is never modified. Corrections are smoothed, applied
++// gradually and kept close to the alignment given by arrival times, so they never
++// produce timestamp jumps or large skews between tracks.
++const (
++	// interval between two samples of the offset between a track and the reference.
++	trackSyncSampleInterval = 2500 * time.Millisecond
++
++	// number of samples used to estimate the offset (5 minutes).
++	trackSyncWindow = 120
++
++	// minimum time span of samples required to estimate a slope.
++	trackSyncMinSlopeSpan = 15 * time.Second
++
++	// a sender report mapping that has not changed for this long is stale.
++	trackSyncStaleAfter = 15 * time.Second
++
++	// the estimated offset is extrapolated at most this far past the last sample.
++	trackSyncMaxExtrapolation = 10 * time.Minute
++
++	// maximum relative drift between two tracks (5%, i.e. a 25fps camera that delivers 24fps).
++	trackSyncMaxSlope = 0.05
++
++	// samples that differ from the prediction more than this are anomalies
++	// (i.e. a camera clock step seen by one track before the other).
++	trackSyncJumpThreshold = 300 * time.Millisecond
++
++	// anomalies that persist this long, consistently, become the new baseline.
++	trackSyncRebaselineAfter = 30 * time.Second
++
++	// anomalies are consistent when their distances from the prediction differ less than this.
++	trackSyncRebaselineTolerance = 200 * time.Millisecond
++
++	// the correction changes at most by 1/trackSyncSlewDiv of the media time elapsed (10%).
++	// It must be larger than trackSyncMaxSlope in order to follow the maximum drift.
++	trackSyncSlewDiv = 10
++
++	// the correction is kept within this distance from the alignment given by arrival times,
++	// so that tracks are never delivered with a large skew (the recorder tolerates 1s).
++	trackSyncMaxArrivalSkew = 500 * time.Millisecond
++
++	// the arrival envelope is the minimum of (arrival time - PTS) in the last
++	// trackSyncEnvelopeBuckets*trackSyncEnvelopeBucket. The window is short since drift
++	// biases the minimum (by 0.3s in the worst case, which shrinks the margin on one side only).
++	trackSyncEnvelopeBucket  = 2 * time.Second
++	trackSyncEnvelopeBuckets = 3
++
++	// backward PTS jumps larger than this are discontinuities.
++	trackSyncDiscontinuity = 10 * time.Second
++
++	// interval between debug reports.
++	trackSyncReportInterval = time.Minute
++)
++
++func trackSyncTicksToDuration(v int64, clockRate int64) time.Duration {
++	secs := v / clockRate
++	dec := v % clockRate
++	return time.Duration(secs)*time.Second + time.Duration(dec*int64(time.Second)/clockRate)
++}
++
++func trackSyncDurationToTicks(d time.Duration, clockRate int64) int64 {
++	secs := int64(d / time.Second)
++	dec := int64(d % time.Second)
++	return secs*clockRate + dec*clockRate/int64(time.Second)
++}
++
++func trackSyncMedian(vals []float64) float64 {
++	slices.Sort(vals)
++	n := len(vals)
++	if n%2 == 1 {
++		return vals[n/2]
++	}
++	return (vals[n/2-1] + vals[n/2]) / 2
++}
++
++type trackSyncSample struct {
++	t float64 // seconds since start
++	v float64 // offset, seconds
++}
++
++// trackSyncEstimator estimates the offset between a track and the reference track,
++// filtering the quantization noise of sender reports with a robust (Theil-Sen) line fit.
++type trackSyncEstimator struct {
++	samples      []trackSyncSample
++	anomalies    []trackSyncSample
++	anomalyResid float64
++	fitted       bool
++	slope        float64
++	intercept    float64
++	lastT        float64
++}
++
++// established is true when the estimator has enough samples to estimate a slope,
++// and therefore to recognize jumps.
++func (e *trackSyncEstimator) established() bool {
++	n := len(e.samples)
++	return n >= 3 && (e.samples[n-1].t-e.samples[0].t) >= trackSyncMinSlopeSpan.Seconds()
++}
++
++// add adds a sample and returns true when the estimator has been re-baselined.
++func (e *trackSyncEstimator) add(t time.Duration, v time.Duration) bool {
++	s := trackSyncSample{t: t.Seconds(), v: v.Seconds()}
++
++	if e.established() {
++		p, _ := e.predict(t)
++		resid := s.v - p.Seconds()
++
++		if math.Abs(resid) > trackSyncJumpThreshold.Seconds() {
++			if len(e.anomalies) != 0 &&
++				math.Abs(resid-e.anomalyResid) > trackSyncRebaselineTolerance.Seconds() {
++				e.anomalies = e.anomalies[:0]
++			}
++			if len(e.anomalies) == 0 {
++				e.anomalyResid = resid
++			}
++			e.anomalies = append(e.anomalies, s)
++
++			if s.t-e.anomalies[0].t < trackSyncRebaselineAfter.Seconds() {
++				return false
++			}
++
++			e.samples = append(e.samples[:0], e.anomalies...)
++			e.anomalies = e.anomalies[:0]
++			e.fit()
++			return true
++		}
++	}
++
++	e.anomalies = e.anomalies[:0]
++	e.samples = append(e.samples, s)
++	if len(e.samples) > trackSyncWindow {
++		e.samples = append(e.samples[:0], e.samples[len(e.samples)-trackSyncWindow:]...)
++	}
++	e.fit()
++	return false
++}
++
++func (e *trackSyncEstimator) fit() {
++	n := len(e.samples)
++	first := e.samples[0]
++	last := e.samples[n-1]
++	e.lastT = last.t
++	span := last.t - first.t
++
++	if n < 3 || span < trackSyncMinSlopeSpan.Seconds() {
++		vals := make([]float64, n)
++		for i, s := range e.samples {
++			vals[i] = s.v
++		}
++		e.slope = 0
++		e.intercept = trackSyncMedian(vals)
++		e.fitted = true
++		return
++	}
++
++	// Theil-Sen slope: median of the slopes between samples that are far enough
++	minDist := span / 2
++	var slopes []float64
++	for i := range n {
++		for j := i + 1; j < n; j++ {
++			dt := e.samples[j].t - e.samples[i].t
++			if dt >= minDist {
++				slopes = append(slopes, (e.samples[j].v-e.samples[i].v)/dt)
++			}
++		}
++	}
++	e.slope = math.Max(-trackSyncMaxSlope, math.Min(trackSyncMaxSlope, trackSyncMedian(slopes)))
++
++	resid := make([]float64, n)
++	for i, s := range e.samples {
++		resid[i] = s.v - e.slope*s.t
++	}
++	e.intercept = trackSyncMedian(resid)
++	e.fitted = true
++}
++
++func (e *trackSyncEstimator) predict(t time.Duration) (time.Duration, bool) {
++	if !e.fitted {
++		return 0, false
++	}
++	ts := math.Min(t.Seconds(), e.lastT+trackSyncMaxExtrapolation.Seconds())
++	return time.Duration((e.intercept + e.slope*ts) * float64(time.Second)), true
++}
++
++type trackSyncEnvelopeBucketData struct {
++	idx int64
++	min time.Duration
++	set bool
++}
++
++// trackSyncEnvelope is the minimum of (arrival time - PTS) in a sliding window,
++// i.e. the latency of a track (plus a constant).
++type trackSyncEnvelope struct {
++	first    time.Duration
++	firstSet bool
++	buckets  [trackSyncEnvelopeBuckets]trackSyncEnvelopeBucketData
++}
++
++func (e *trackSyncEnvelope) update(elapsed time.Duration, v time.Duration) {
++	if !e.firstSet {
++		e.first = elapsed
++		e.firstSet = true
++	}
++
++	idx := int64(elapsed / trackSyncEnvelopeBucket)
++	b := &e.buckets[idx%trackSyncEnvelopeBuckets]
++	if !b.set || b.idx != idx {
++		*b = trackSyncEnvelopeBucketData{idx: idx, min: v, set: true}
++	} else if v < b.min {
++		b.min = v
++	}
++}
++
++func (e *trackSyncEnvelope) value(elapsed time.Duration) (time.Duration, bool) {
++	// require at least one complete bucket
++	if !e.firstSet || (elapsed-e.first) < trackSyncEnvelopeBucket {
++		return 0, false
++	}
++
++	idx := int64(elapsed / trackSyncEnvelopeBucket)
++	var v time.Duration
++	found := false
++	for _, b := range e.buckets {
++		if b.set && (idx-b.idx) < trackSyncEnvelopeBuckets && (!found || b.min < v) {
++			v = b.min
++			found = true
++		}
++	}
++	return v, found
++}
++
++type trackSyncTrack struct {
++	s         *trackSync
++	id        int
++	codec     string
++	clockRate int64
++
++	// offset between the time given by sender reports (relative to the epoch) and the raw PTS.
++	// It changes only when a sender report is received.
++	srOff        time.Duration
++	srOffSet     bool
++	srOffChanged bool
++	srOffAt      time.Time // when srOff was last set to a new value
++
++	env trackSyncEnvelope
++
++	// correction state, used by tracks other than the reference.
++	est         trackSyncEstimator
++	lastSample  time.Time
++	frontier    int64
++	frontierSet bool
++	corr        int64 // ticks
++	locked      bool
++	lastReport  time.Time
++}
++
++func (t *trackSyncTrack) fresh(now time.Time) bool {
++	return !t.srOffChanged || now.Sub(t.srOffAt) <= trackSyncStaleAfter
++}
++
++// process returns the PTS of a packet, aligned to the reference track when possible.
++// pts is the PTS given by the RTP time decoder; srNTP is the time of the packet
++// computed with the last sender report (srOK is false until one is received).
++func (t *trackSyncTrack) process(pts int64, srNTP time.Time, srOK bool) int64 {
++	s := t.s
++	s.mutex.Lock()
++	defer s.mutex.Unlock()
++
++	now := s.timeNow()
++	elapsed := now.Sub(s.start)
++	rawDur := trackSyncTicksToDuration(pts, t.clockRate)
++
++	t.env.update(elapsed, elapsed-rawDur)
++
++	if srOK {
++		if !s.epochSet {
++			s.epoch = srNTP
++			s.epochSet = true
++		}
++		off := srNTP.Sub(s.epoch) - rawDur
++		if !t.srOffSet {
++			t.srOff = off
++			t.srOffSet = true
++			t.srOffAt = now
++		} else if d := off - t.srOff; d > time.Microsecond || d < -time.Microsecond {
++			t.srOff = off
++			t.srOffChanged = true
++			t.srOffAt = now
++		}
++	}
++
++	if t == s.ref {
++		return pts
++	}
++
++	ref := s.ref
++
++	// sample the offset with respect to the reference track. The sample refers to the
++	// instant of the last sender report of this track, since the offset is constant between reports.
++	if t.srOffSet && ref.srOffSet && t.fresh(now) && ref.fresh(now) &&
++		(t.lastSample.IsZero() || now.Sub(t.lastSample) >= trackSyncSampleInterval) {
++		t.lastSample = now
++		if t.est.add(t.srOffAt.Sub(s.start), t.srOff-ref.srOff) {
++			s.log.Log(logger.Warn, "RTCP sender reports of track %d (%s) and track %d (%s) jumped, "+
++				"re-synchronizing them", t.id, t.codec, ref.id, ref.codec)
++		}
++	}
++
++	switch {
++	case !t.frontierSet || pts < t.frontier-trackSyncDurationToTicks(trackSyncDiscontinuity, t.clockRate):
++		t.frontier = pts
++		t.frontierSet = true
++
++	// change the correction only when the stream moves forward, gradually,
++	// in order to keep timestamps monotonic (also in case of B-frames).
++	case pts > t.frontier:
++		adv := pts - t.frontier
++		t.frontier = pts
++
++		target, ok := t.target(elapsed)
++		if !ok {
++			break
++		}
++
++		maxStep := adv / trackSyncSlewDiv
++		step := trackSyncDurationToTicks(target, t.clockRate) - t.corr
++		step = max(-maxStep, min(maxStep, step))
++		t.corr += step
++
++		if !t.locked {
++			t.locked = true
++			s.log.Log(logger.Info, "track %d (%s) is synchronized with track %d (%s) through RTCP sender reports",
++				t.id, t.codec, ref.id, ref.codec)
++		}
++
++		if now.Sub(t.lastReport) >= trackSyncReportInterval {
++			t.lastReport = now
++			s.log.Log(logger.Debug, "track %d (%s): sync correction %v, target %v, drift %.0f ppm",
++				t.id, t.codec, trackSyncTicksToDuration(t.corr, t.clockRate), target, t.est.slope*1e6)
++		}
++	}
++
++	return pts + t.corr
++}
++
++// target returns the correction to apply, limited around the alignment given by arrival times.
++func (t *trackSyncTrack) target(elapsed time.Duration) (time.Duration, bool) {
++	target, ok := t.est.predict(elapsed)
++	if !ok {
++		return 0, false
++	}
++
++	envT, ok := t.env.value(elapsed)
++	if !ok {
++		return 0, false
++	}
++
++	envRef, ok := t.s.ref.env.value(elapsed)
++	if !ok {
++		return 0, false
++	}
++
++	// correction that would deliver this track with the same latency as the reference
++	arrival := envT - envRef
++	return max(arrival-trackSyncMaxArrivalSkew, min(arrival+trackSyncMaxArrivalSkew, target)), true
++}
++
++// trackSync aligns the tracks of a RTSP session by using RTCP sender reports.
++type trackSync struct {
++	timeNow func() time.Time
++	log     logger.Writer
++
++	mutex    sync.Mutex
++	start    time.Time
++	epoch    time.Time
++	epochSet bool
++	ref      *trackSyncTrack
++	tracks   map[format.Format]*trackSyncTrack
++}
++
++func (s *trackSync) initialize(medias []*description.Media) {
++	if s.timeNow == nil {
++		s.timeNow = time.Now
++	}
++	s.start = s.timeNow()
++	s.tracks = make(map[format.Format]*trackSyncTrack)
++
++	id := 1
++	var first *trackSyncTrack
++
++	for _, medi := range medias {
++		for _, forma := range medi.Formats {
++			if forma.ClockRate() > 0 {
++				t := &trackSyncTrack{
++					s:         s,
++					id:        id,
++					codec:     forma.Codec(),
++					clockRate: int64(forma.ClockRate()),
++				}
++				s.tracks[forma] = t
++
++				if first == nil {
++					first = t
++				}
++				if s.ref == nil && medi.Type == description.MediaTypeAudio {
++					s.ref = t
++				}
++			}
++			id++
++		}
++	}
++
++	if s.ref == nil {
++		s.ref = first
++	}
++}
++
++// track returns the synchronizer of a track, or nil if the track cannot be synchronized.
++func (s *trackSync) track(forma format.Format) *trackSyncTrack {
++	if len(s.tracks) < 2 {
++		return nil
++	}
++	return s.tracks[forma]
++}
+diff --git a/internal/protocols/rtsp/track_sync_test.go b/internal/protocols/rtsp/track_sync_test.go
+new file mode 100644
+index 0000000..3426898
+--- /dev/null
++++ b/internal/protocols/rtsp/track_sync_test.go
+@@ -0,0 +1,529 @@
++package rtsp
++
++import (
++	"math"
++	"math/rand"
++	"sort"
++	"testing"
++	"time"
++
++	"github.com/bluenviron/gortsplib/v5/pkg/description"
++	"github.com/bluenviron/gortsplib/v5/pkg/format"
++	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
++	"github.com/stretchr/testify/require"
++
++	"github.com/bluenviron/mediamtx/internal/logger"
++)
++
++type trackSyncTestLogger struct {
++	warns int
++	infos int
++}
++
++func (l *trackSyncTestLogger) Log(level logger.Level, _ string, _ ...any) {
++	switch level {
++	case logger.Warn:
++		l.warns++
++	case logger.Info:
++		l.infos++
++	}
++}
++
++type trackSyncSimTrack struct {
++	forma       format.Format
++	mediaType   description.MediaType
++	clockRate   int64
++	ticks       int64   // nominal RTP ticks per unit
++	realPeriod  float64 // actual seconds between units
++	latency     float64 // base arrival latency, seconds
++	jitter      float64 // random additional latency, seconds
++	tsBase      uint32
++	srOffset    float64 // first sender report, seconds after start
++	reorder     bool    // emulate B-frames (I P B B pattern)
++	noSR        bool
++	srGap       [2]float64 // no sender reports in this interval (seconds)
++	srNTPOffset func(sent float64) float64
++
++	// filled by the simulation
++	pts []trackSyncSimOut
++}
++
++type trackSyncSimOut struct {
++	capture float64
++	arrival float64
++	rawPTS  int64
++	outPTS  int64
++}
++
++type trackSyncSimEvent struct {
++	arrival float64
++	track   int
++	unit    int
++	capture float64
++	ts      uint32
++	sr      bool
++	srNTP   float64
++	srRTP   uint32
++}
++
++type trackSyncSimSR struct {
++	ntp float64
++	rtp uint32
++}
++
++type trackSyncSim struct {
++	duration   float64
++	camClockPP float64 // camera clock error, ppm
++	camEpoch   time.Time
++	seed       int64
++	tracks     []*trackSyncSimTrack
++	log        trackSyncTestLogger
++}
++
++// presentation index of the unit sent in position i, emulating B-frames when requested
++// (decode order: I0 P3 B1 B2 P6 B4 B5 ...).
++func (tr *trackSyncSimTrack) presIndex(i int) int {
++	if !tr.reorder || i == 0 {
++		return i
++	}
++	k := (i - 1) / 3
++	switch (i - 1) % 3 {
++	case 0:
++		return 3 * (k + 1)
++	case 1:
++		return 3*k + 1
++	default:
++		return 3*k + 2
++	}
++}
++
++func (sim *trackSyncSim) run(t *testing.T) {
++	rnd := rand.New(rand.NewSource(sim.seed))
++	var events []trackSyncSimEvent
++
++	camNTP := func(realT float64) float64 {
++		return realT * (1 + sim.camClockPP*1e-6)
++	}
++
++	for ti, tr := range sim.tracks {
++		n := int(sim.duration / tr.realPeriod)
++		for i := range n {
++			pres := tr.presIndex(i)
++			sent := float64(i) * tr.realPeriod
++			if tr.reorder {
++				sent += 2 * tr.realPeriod
++			}
++			events = append(events, trackSyncSimEvent{
++				arrival: sent + tr.latency + rnd.Float64()*tr.jitter,
++				track:   ti,
++				unit:    i,
++				capture: float64(pres) * tr.realPeriod,
++				ts:      tr.tsBase + uint32(int64(pres)*tr.ticks),
++			})
++		}
++
++		if tr.noSR {
++			continue
++		}
++
++		for sent := tr.srOffset; sent < sim.duration; sent += 5 {
++			if sent >= tr.srGap[0] && sent < tr.srGap[1] {
++				continue
++			}
++			// a sender report maps the RTP timestamp of the last unit to its capture time,
++			// with noise (real cameras show up to +-30ms).
++			last := int(sent / tr.realPeriod)
++			ntp := camNTP(float64(last)*tr.realPeriod) + (rnd.Float64()*2-1)*0.03
++			if tr.srNTPOffset != nil {
++				ntp += tr.srNTPOffset(sent)
++			}
++			events = append(events, trackSyncSimEvent{
++				arrival: sent + 0.002,
++				track:   ti,
++				sr:      true,
++				srNTP:   ntp,
++				srRTP:   tr.tsBase + uint32(int64(tr.presIndex(last))*tr.ticks),
++			})
++		}
++	}
++
++	sort.SliceStable(events, func(a, b int) bool { return events[a].arrival < events[b].arrival })
++
++	var medias []*description.Media
++	for _, tr := range sim.tracks {
++		medias = append(medias, &description.Media{Type: tr.mediaType, Formats: []format.Format{tr.forma}})
++	}
++
++	start := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
++	now := start
++	ts := &trackSync{
++		log:     &sim.log,
++		timeNow: func() time.Time { return now },
++	}
++	ts.initialize(medias)
++
++	lastSR := make([]*trackSyncSimSR, len(sim.tracks))
++	firstArrival := make([]float64, len(sim.tracks))
++	firstTS := make([]uint32, len(sim.tracks))
++	accum := make([]int64, len(sim.tracks))
++	prevTS := make([]uint32, len(sim.tracks))
++	started := make([]bool, len(sim.tracks))
++	globalStart := -1.0
++
++	for _, ev := range events {
++		now = start.Add(time.Duration(ev.arrival * float64(time.Second)))
++		tr := sim.tracks[ev.track]
++
++		if ev.sr {
++			lastSR[ev.track] = &trackSyncSimSR{ntp: ev.srNTP, rtp: ev.srRTP}
++			continue
++		}
++
++		// emulate the RTP time decoder
++		if !started[ev.track] {
++			started[ev.track] = true
++			if globalStart < 0 {
++				globalStart = ev.arrival
++			}
++			firstArrival[ev.track] = ev.arrival
++			firstTS[ev.track] = ev.ts
++			accum[ev.track] = int64(math.Round((ev.arrival - globalStart) * float64(tr.clockRate)))
++		} else {
++			accum[ev.track] += int64(int32(ev.ts - prevTS[ev.track]))
++		}
++		prevTS[ev.track] = ev.ts
++		raw := accum[ev.track]
++
++		var srNTP time.Time
++		srOK := false
++		if sr := lastSR[ev.track]; sr != nil {
++			d := float64(int32(ev.ts-sr.rtp)) / float64(tr.clockRate)
++			srNTP = sim.camEpoch.Add(time.Duration((sr.ntp + d) * float64(time.Second)))
++			srOK = true
++		}
++
++		out := raw
++		if st := ts.track(tr.forma); st != nil {
++			out = st.process(raw, srNTP, srOK)
++		}
++
++		tr.pts = append(tr.pts, trackSyncSimOut{capture: ev.capture, arrival: ev.arrival, rawPTS: raw, outPTS: out})
++	}
++
++	// sanity
++	for _, tr := range sim.tracks {
++		require.NotEmpty(t, tr.pts)
++	}
++}
++
++// syncErrors returns, for every unit of track ti, the difference between its output time and the
++// output time the reference track has at the same capture instant (the reference track is assumed
++// to have an exact clock, which is true in these simulations).
++func (sim *trackSyncSim) syncErrors(ti int, refI int) []float64 {
++	ref := sim.tracks[refI]
++	r0 := ref.pts[0]
++	refAt := func(capture float64) float64 {
++		return float64(r0.outPTS)/float64(ref.clockRate) + (capture - r0.capture)
++	}
++
++	tr := sim.tracks[ti]
++	errs := make([]float64, len(tr.pts))
++	for i, o := range tr.pts {
++		errs[i] = float64(o.outPTS)/float64(tr.clockRate) - refAt(o.capture)
++	}
++	return errs
++}
++
++func trackSyncMaxAbs(vals []float64) float64 {
++	m := 0.0
++	for _, v := range vals {
++		m = math.Max(m, math.Abs(v))
++	}
++	return m
++}
++
++func newTrackSyncCam5Sim(duration float64) *trackSyncSim {
++	return &trackSyncSim{
++		duration: duration,
++		camEpoch: time.Date(2011, 12, 3, 0, 0, 0, 0, time.UTC),
++		seed:     1,
++		tracks: []*trackSyncSimTrack{
++			{ // H265, 10fps, stamped 9000 ticks per frame, encoded at 9.9834fps (-1663 ppm)
++				forma:      &format.H265{PayloadTyp: 96},
++				mediaType:  description.MediaTypeVideo,
++				clockRate:  90000,
++				ticks:      9000,
++				realPeriod: 0.1 / (1 - 1663e-6),
++				latency:    0.06,
++				jitter:     0.15,
++				tsBase:     4164816704,
++				srOffset:   1.2,
++			},
++			{ // AAC 16kHz, exact clock
++				forma: &format.MPEG4Audio{
++					PayloadTyp: 97,
++					Config: &mpeg4audio.AudioSpecificConfig{
++						Type:         mpeg4audio.ObjectTypeAACLC,
++						SampleRate:   16000,
++						ChannelCount: 1,
++					},
++				},
++				mediaType:  description.MediaTypeAudio,
++				clockRate:  16000,
++				ticks:      1024,
++				realPeriod: 1024.0 / 16000,
++				latency:    0.04,
++				jitter:     0.02,
++				tsBase:     1506459648,
++				srOffset:   3.7,
++			},
++		},
++	}
++}
++
++func newTrackSyncCam1Sim(duration float64) *trackSyncSim {
++	return &trackSyncSim{
++		duration: duration,
++		camEpoch: time.Date(2011, 12, 3, 0, 0, 0, 0, time.UTC),
++		seed:     2,
++		tracks: []*trackSyncSimTrack{
++			{ // H265, 25fps, stamped 3600 ticks per frame, encoded at 25.0202fps (+809 ppm)
++				forma:      &format.H265{PayloadTyp: 108},
++				mediaType:  description.MediaTypeVideo,
++				clockRate:  90000,
++				ticks:      3600,
++				realPeriod: 0.04 / (1 + 809e-6),
++				latency:    0.03,
++				jitter:     0.08,
++				tsBase:     4294967295 - 90000*30, // wraps after 30s
++				srOffset:   0.4,
++			},
++			{ // G711, 64ms packets, exact clock
++				forma:      &format.G711{PayloadTyp: 0, MULaw: true, SampleRate: 8000, ChannelCount: 1},
++				mediaType:  description.MediaTypeAudio,
++				clockRate:  8000,
++				ticks:      512,
++				realPeriod: 512.0 / 8000,
++				latency:    0.03,
++				jitter:     0.02,
++				tsBase:     103768184,
++				srOffset:   2.9,
++			},
++		},
++	}
++}
++
++// sync error after convergence: under 50ms after one minute, under 30ms after ten minutes
++// (sender reports have +-30ms of noise).
++func requireSynced(t *testing.T, sim *trackSyncSim, errs []float64) {
++	p := sim.tracks[0].realPeriod
++	require.Less(t, trackSyncMaxAbs(errs[int(60/p):]), 0.05)
++	require.Less(t, trackSyncMaxAbs(errs[int(600/p):]), 0.03)
++}
++
++func requireMonotonic(t *testing.T, tr *trackSyncSimTrack) {
++	for i := 1; i < len(tr.pts); i++ {
++		dRaw := tr.pts[i].rawPTS - tr.pts[i-1].rawPTS
++		dOut := tr.pts[i].outPTS - tr.pts[i-1].outPTS
++		if dRaw > 0 {
++			require.Greater(t, dOut, int64(0), "unit %d", i)
++		} else if dRaw < 0 {
++			require.Less(t, dOut, int64(0), "unit %d", i)
++		}
++		// correction never changes by more than 10% of the media time elapsed (+1 tick rounding)
++		require.LessOrEqual(t, math.Abs(float64(dOut-dRaw)), math.Abs(float64(dRaw))/10+1, "unit %d", i)
++	}
++}
++
++func requireUnchanged(t *testing.T, tr *trackSyncSimTrack) {
++	for _, o := range tr.pts {
++		require.Equal(t, o.rawPTS, o.outPTS)
++	}
++}
++
++func TestTrackSyncTicks(t *testing.T) {
++	for _, v := range []int64{0, 1, 89999, 90000, 1234567890123, -90001} {
++		d := trackSyncTicksToDuration(v, 90000)
++		require.InDelta(t, v, trackSyncDurationToTicks(d, 90000), 1)
++	}
++	// no overflow after a long time
++	require.Equal(t, 30*24*time.Hour, trackSyncTicksToDuration(90000*3600*24*30, 90000))
++}
++
++func TestTrackSyncSlowVideo(t *testing.T) {
++	sim := newTrackSyncCam5Sim(2 * 3600)
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++
++	errs := sim.syncErrors(0, 1)
++
++	// without synchronization, video would lag by 1663 ppm * 2h = 12s
++	last := sim.tracks[0].pts[len(sim.tracks[0].pts)-1]
++	require.Greater(t, math.Abs(float64(last.outPTS-last.rawPTS)/90000), 11.0)
++
++	// after convergence, video is aligned with audio
++	requireSynced(t, sim, errs)
++
++	// before the first sender report, timestamps are the ones of the RTP time decoder
++	require.Equal(t, sim.tracks[0].pts[0].rawPTS, sim.tracks[0].pts[0].outPTS)
++	require.Equal(t, 0, sim.log.warns)
++	require.Equal(t, 1, sim.log.infos)
++}
++
++func TestTrackSyncFastVideoWithWraparound(t *testing.T) {
++	sim := newTrackSyncCam1Sim(2 * 3600)
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++
++	errs := sim.syncErrors(0, 1)
++	requireSynced(t, sim, errs)
++	require.Equal(t, 0, sim.log.warns)
++}
++
++func TestTrackSyncExtremeDrift(t *testing.T) {
++	// a 25fps camera that only delivers 24fps but stamps 3600 ticks per frame (-4%)
++	sim := newTrackSyncCam1Sim(3600)
++	sim.tracks[0].realPeriod = 1.0 / 24
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++
++	errs := sim.syncErrors(0, 1)
++	requireSynced(t, sim, errs)
++	require.Equal(t, 0, sim.log.warns)
++}
++
++func TestTrackSyncNoSenderReports(t *testing.T) {
++	sim := newTrackSyncCam5Sim(1800)
++	sim.tracks[0].noSR = true
++	sim.tracks[1].noSR = true
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[0])
++	requireUnchanged(t, sim.tracks[1])
++	require.Equal(t, 0, sim.log.infos)
++}
++
++func TestTrackSyncReferenceWithoutSenderReports(t *testing.T) {
++	sim := newTrackSyncCam5Sim(1800)
++	sim.tracks[1].noSR = true
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[0])
++	requireUnchanged(t, sim.tracks[1])
++}
++
++func TestTrackSyncMissingSenderReports(t *testing.T) {
++	// no video sender reports for 8 minutes
++	sim := newTrackSyncCam5Sim(3600)
++	sim.tracks[0].srGap = [2]float64{1200, 1680}
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++
++	errs := sim.syncErrors(0, 1)
++	conv := int(60 / sim.tracks[0].realPeriod)
++	// the trend is extrapolated, so the error stays small (without it, it would grow to 0.8s)
++	require.Less(t, trackSyncMaxAbs(errs[conv:]), 0.06)
++	require.Equal(t, 0, sim.log.warns)
++}
++
++func TestTrackSyncMissingSenderReportsLong(t *testing.T) {
++	// no video sender reports for 30 minutes: the correction stops after 10 minutes of
++	// extrapolation and resumes, gradually, when sender reports come back.
++	sim := newTrackSyncCam5Sim(3 * 3600)
++	sim.tracks[0].srGap = [2]float64{1200, 3000}
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++
++	errs := sim.syncErrors(0, 1)
++	// the skew between tracks never exceeds what the recorder tolerates
++	require.Less(t, trackSyncMaxAbs(errs[int(60/sim.tracks[0].realPeriod):]), 0.6)
++	// and it is recovered at the end
++	require.Less(t, trackSyncMaxAbs(errs[len(errs)-int(600/sim.tracks[0].realPeriod):]), 0.03)
++}
++
++func TestTrackSyncCameraClockStep(t *testing.T) {
++	// the camera clock steps forward by one hour (i.e. NTP synchronization).
++	// Video sender reports see the step 2.5s before audio ones.
++	sim := newTrackSyncCam5Sim(3600)
++	step := func(sent float64) float64 {
++		if sent >= 1800 {
++			return 3600
++		}
++		return 0
++	}
++	sim.tracks[0].srNTPOffset = step
++	sim.tracks[1].srNTPOffset = step
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++
++	errs := sim.syncErrors(0, 1)
++	requireSynced(t, sim, errs)
++	require.Equal(t, 0, sim.log.warns)
++}
++
++func TestTrackSyncSingleTrackJump(t *testing.T) {
++	// sender reports of the video track jump by 2s and stay there (broken camera).
++	// The tracks must never be skewed more than what the recorder tolerates.
++	sim := newTrackSyncCam5Sim(3600)
++	sim.tracks[0].srNTPOffset = func(sent float64) float64 {
++		if sent >= 1800 {
++			return 2
++		}
++		return 0
++	}
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++
++	errs := sim.syncErrors(0, 1)
++	conv := int(60 / sim.tracks[0].realPeriod)
++	require.Less(t, trackSyncMaxAbs(errs[conv:]), trackSyncMaxArrivalSkew.Seconds()+0.15)
++	require.Equal(t, 1, sim.log.warns)
++}
++
++func TestTrackSyncLargeDeclaredSkew(t *testing.T) {
++	// sender reports declare that video is captured 3s before audio, while packets arrive together.
++	// Delivery skew must stay below what the recorder tolerates.
++	sim := newTrackSyncCam5Sim(1800)
++	sim.tracks[0].srNTPOffset = func(float64) float64 { return -3 }
++	sim.run(t)
++
++	requireMonotonic(t, sim.tracks[0])
++
++	tr := sim.tracks[0]
++	ref := sim.tracks[1]
++	r0 := ref.pts[0]
++	for _, o := range tr.pts[int(60/tr.realPeriod):] {
++		refOut := float64(r0.outPTS)/16000 + (o.arrival - r0.arrival)
++		require.Less(t, math.Abs(float64(o.outPTS)/90000-refOut), 1.0)
++	}
++}
++
++func TestTrackSyncBFrames(t *testing.T) {
++	sim := newTrackSyncCam5Sim(1800)
++	sim.tracks[0].reorder = true
++	sim.run(t)
++
++	requireUnchanged(t, sim.tracks[1])
++	requireMonotonic(t, sim.tracks[0])
++}
++
++func TestTrackSyncSingleTrack(t *testing.T) {
++	ts := &trackSync{log: &trackSyncTestLogger{}}
++	forma := &format.H265{PayloadTyp: 96}
++	ts.initialize([]*description.Media{{Type: description.MediaTypeVideo, Formats: []format.Format{forma}}})
++	require.Nil(t, ts.track(forma))
++}
+-- 
+2.50.1 (Apple Git-155)
+

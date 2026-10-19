@@ -94,35 +94,18 @@ services:
     volumes:
       - ./mediamtx-certs:/certs
 
-  # MediaMTX — RTSP / HLS / WebRTC streaming server. Inline build =
-  # official MediaMTX binary + curl (for runOnInit webhooks).
+  # MediaMTX — RTSP / HLS / WebRTC streaming server. Built from the
+  # MediaMTX source plus OpenNVR's patches, with curl (for runOnInit webhooks).
   mediamtx:
     build:
-      context: .
-      dockerfile_inline: |
-        # Base on curlimages/curl (working curl for the healthcheck +
-        # runOnInit hooks, no `apk add`), then copy in the statically-linked
-        # mediamtx binary. If you change the FROM line, re-audit inherited
-        # USER/WORKDIR/ENTRYPOINT/CMD/ENV so the boot doesn't silently break.
-        FROM postgres:15-alpine AS tz-source
-        FROM bluenviron/mediamtx:1.15.4 AS mediamtx-base
-        FROM curlimages/curl:8.10.1
-        USER root
-        WORKDIR /
-        # TZ=<IANA name> only takes effect if the zoneinfo database is present —
-        # without it the Go runtime silently falls back to UTC and recording
-        # directories get named in UTC while opennvr_core parses them in the
-        # configured zone. Copy the database out of postgres:15-alpine (already
-        # pinned and pulled by this stack, so no extra image) instead of
-        # `apk add tzdata`: an apk install makes every build of this image
-        # depend on the Alpine package CDN being reachable, and when it blips
-        # ("temporary error (try again later)") the whole stack fails to build.
-        # zoneinfo files are plain TZif data — arch- and libc-independent.
-        COPY --from=tz-source /usr/share/zoneinfo /usr/share/zoneinfo
-        # Clear any inherited CMD so it isn't passed to mediamtx as a config arg.
-        CMD []
-        COPY --from=mediamtx-base /mediamtx /mediamtx
-        ENTRYPOINT ["/mediamtx"]
+      # MediaMTX v1.15.4 built from source plus OpenNVR's patches
+      # (docker/mediamtx-build/patches): RTSP tracks are kept in sync with the
+      # cameras' RTCP sender reports, so recordings no longer lose video or
+      # audio when a camera's video clock drifts. The runtime image is the
+      # same as before: curlimages/curl base, zoneinfo from postgres:15-alpine,
+      # /mediamtx entrypoint. See docker/mediamtx-build/Dockerfile.
+      context: ./docker/mediamtx-build
+      dockerfile: Dockerfile
     container_name: opennvr_mediamtx
     logging: *svc-logs
     restart: unless-stopped
