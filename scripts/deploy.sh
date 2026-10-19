@@ -6,7 +6,9 @@
 #
 #   scripts/deploy.sh                 # deploy origin/main
 #   scripts/deploy.sh --ref <commit>  # deploy a specific commit/branch
+#   scripts/deploy.sh --check         # only the checks before step 2; change nothing
 #   scripts/deploy.sh --yes           # no confirmation prompt
+#   scripts/deploy.sh --allow-recorder-restart   # accept a gap in the footage
 #
 # Run it from the checkout the live stack runs from (the one with .env).
 # In order, and stopping at the first failure:
@@ -28,8 +30,24 @@
 # the database restored from the step-3 dump if a migration ran (anything
 # written in the minutes between is lost), and ./start.sh up again.
 #
-# Recordings are written by MediaMTX, which only restarts if the update
-# changed its own configuration.
+# Footage comes first. MediaMTX records every camera, and anything that
+# restarts or reconfigures it loses footage on all of them: the 2026-10-19
+# deploy of the RTCP fix cost 17 s per camera. Restarting core does not stop
+# recording. The segments written while core is down are indexed by its
+# reconciler when it comes back. So, before anything changes:
+#
+#   * the deploy is refused if the target would restart or reconfigure the
+#     recorder: its Compose definition (Compose's own config hash, rendered
+#     from the target tree, against the running container's), its
+#     hot-reloaded config file, or the core code that provisions its paths
+#     at startup. --allow-recorder-restart deploys it anyway, for a time
+#     when a gap is acceptable;
+#   * the cameras recording right now are noted.
+#
+# Afterwards, also after a rollback, it checks that the recorder is the same
+# process, that every one of those cameras is still writing, and it measures
+# the gaps between segment files since the deploy began. Exit status 2 means
+# the deploy finished but that check found a problem.
 
 set -Eeuo pipefail
 
@@ -42,9 +60,20 @@ BACKUP_DIR="${OPENNVR_BACKUP_DIR:-$HOME/opennvr-backups}"
 BACKUPS_TO_KEEP=10
 HEALTH_TIMEOUT_S=300
 
+# The recorder. Its config file is bind-mounted and hot-reloaded; the core
+# files provision its paths (source, recordPath, segment length) at startup.
+# Its image (docker/mediamtx-build) is never rebuilt by this script.
+REC_CONTAINER="opennvr_mediamtx"
+REC_SERVICE="mediamtx"
+REC_CONFIG="mediamtx.docker.yml"
+REC_PROVISIONING="server/services/mediamtx_startup_service.py server/services/mediamtx_admin_service.py server/services/stream_service.py"
+REC_IMAGE_CONTEXT="docker/mediamtx-build"
+
 REF="origin/main"
 ASSUME_YES=0
 FETCH=1
+CHECK_ONLY=0
+ALLOW_RECORDER_RESTART=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; GRAY='\033[0;90m'; NC='\033[0m'
 say()  { echo -e "  $*"; }
@@ -56,13 +85,15 @@ die()  { echo -e "  ${RED}✗ $*${NC}" >&2; exit 1; }
 LOG=$(mktemp -t opennvr-deploy.XXXXXX)
 show_log() { echo -e "  ${GRAY}── last lines of $LOG ──${NC}" >&2; tail -25 "$LOG" | sed 's/^/      /' >&2; }
 
-usage() { sed -n '5,9p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '5,11p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --ref) [ $# -ge 2 ] || die "--ref needs a value"; REF="$2"; shift 2 ;;
         --yes|-y) ASSUME_YES=1; shift ;;
         --no-fetch) FETCH=0; shift ;;
+        --check) CHECK_ONLY=1; shift ;;
+        --allow-recorder-restart) ALLOW_RECORDER_RESTART=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -74,6 +105,7 @@ if [ -d /Applications/Docker.app/Contents/Resources/bin ]; then
     PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
 fi
 command -v docker >/dev/null || die "docker not found"
+command -v python3 >/dev/null || die "python3 not found (the footage checks need it)"
 docker info >/dev/null 2>&1 || die "Docker isn't running"
 
 [ -f .env ] || die "no .env here — run this from the checkout the live stack runs from"
@@ -95,6 +127,129 @@ db_name() { docker exec "$DB_CONTAINER" printenv POSTGRES_DB; }
 db_revision() {
     docker exec "$DB_CONTAINER" psql -U "$(db_user)" -d "$(db_name)" -tAc \
         "select version_num from alembic_version" 2>/dev/null | tr -d '[:space:]'
+}
+
+fmt_time() { date -r "$1" +%H:%M:%S 2>/dev/null || date -d "@$1" +%H:%M:%S; }
+
+recorder_identity() {
+    docker inspect -f '{{.Id}} {{.State.StartedAt}}' "$REC_CONTAINER" 2>/dev/null || echo "not running"
+}
+
+# Compose recreates a container when its config hash changes: render the
+# recorder's from the target tree, with the arguments `./start.sh up` uses,
+# and the project directory (paths, .env, project name) of this checkout.
+recorder_target_hash() {
+    local tree args a hash
+    tree=$(mktemp -d -t opennvr-deploy-tree.XXXXXX)
+    git archive "$TARGET" -- 'docker-compose*.yml' | tar -x -C "$tree" || true
+    args=$(./start.sh compose-args 2>/dev/null) || args="-f docker-compose.yml"
+    set -- $args
+    local render=()
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "-f" ] && [ $# -ge 2 ]; then render+=(-f "$tree/$2"); shift 2
+        else render+=("$1"); shift; fi
+    done
+    hash=$(docker compose --project-directory "$PWD" ${render[@]+"${render[@]}"} config --hash "$REC_SERVICE" 2>/dev/null \
+        | awk -v s="$REC_SERVICE" '$1 == s { print $2 }') || hash=""
+    rm -rf "$tree"
+    echo "$hash"
+}
+
+# The footage on disk, read directly (the database may lag): `live` lists
+# the cameras whose newest segment was written in the last 30 s; `gaps <t>`
+# lists every gap over 3 s between consecutive segments since epoch <t>.
+# A segment starts at the time in its name (cam-N/YYYY-MM-DD/HH/MM-SS-us.mp4,
+# in the recorder's TZ) and ends at its last write.
+recording_scan() {
+    local root
+    root=$(env_get RECORDINGS_PATH)
+    python3 - "${root:-./recordings}" "$(env_get TZ)" "$@" <<'PY'
+import os, sys, time
+from datetime import datetime
+
+root, tzname, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+since = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tzname) if tzname else None
+except Exception:
+    tz = None  # host local time, which the launcher also hands MediaMTX
+now = time.time()
+
+def subdirs(path):
+    try:
+        return sorted((e for e in os.scandir(path) if e.is_dir()), key=lambda e: e.name)
+    except OSError:
+        return []
+
+def segments(cam):
+    hours = [(day.name, hour) for day in subdirs(cam)[-2:] for hour in subdirs(day.path)]
+    out = []
+    for day, hour in sorted(hours, key=lambda dh: (dh[0], dh[1].name))[-2:]:
+        try:
+            files = list(os.scandir(hour.path))
+        except OSError:
+            continue
+        for f in files:
+            if not f.name.endswith(".mp4"):
+                continue
+            try:
+                end = f.stat().st_mtime
+                y, mo, d = (int(x) for x in day.split("-"))
+                mi, s, us = (int(x) for x in f.name[:-4].split("-"))
+                start = datetime(y, mo, d, int(hour.name), mi, s, us, tzinfo=tz).timestamp()
+            except (OSError, ValueError):
+                continue
+            out.append((start, end))
+    return sorted(out)
+
+cams = [c for c in subdirs(root) if c.name.startswith("cam-") and not c.name.endswith("-sub")]
+for cam in cams:
+    segs = segments(cam.path)
+    if mode == "live":
+        if segs and now - max(end for _, end in segs) <= 30:
+            print(cam.name)
+    elif mode == "gaps":
+        segs = [seg for seg in segs if seg[1] >= since - 120]
+        for (_, end), (start, _) in zip(segs, segs[1:]):
+            if start - end > 3:
+                print("%s: %.1f s with no footage from %s"
+                      % (cam.name, start - end, time.strftime("%H:%M:%S", time.localtime(end))))
+PY
+}
+
+FOOTAGE_OK=1
+verify_footage() {
+    local missing live cam gaps deadline
+    if [ "$(recorder_identity)" != "$REC_BEFORE" ]; then
+        warn "the recorder restarted during this deploy"
+        FOOTAGE_OK=0
+    fi
+    # A camera that dropped reconnects within seconds; give it a minute.
+    deadline=$(( $(date +%s) + 60 ))
+    while :; do
+        live=" $( (recording_scan live || true) | tr '\n' ' ') "
+        missing=""
+        for cam in $RECORDING_BEFORE; do
+            case "$live" in *" $cam "*) ;; *) missing="$missing $cam" ;; esac
+        done
+        if [ -z "$missing" ] || [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+        sleep 5
+    done
+    if [ -n "$missing" ]; then
+        warn "not recording now, though they were before the deploy:$missing"
+        FOOTAGE_OK=0
+    else
+        ok "all $(echo $RECORDING_BEFORE | wc -w | tr -d ' ') camera(s) that were recording still are"
+    fi
+    gaps=$(recording_scan gaps "$DEPLOY_START") || gaps="(the scan of the recordings failed)"
+    if [ -n "$gaps" ]; then
+        warn "gaps in the footage since the deploy began at $(fmt_time "$DEPLOY_START"):"
+        echo "$gaps" | sed 's/^/      /'
+        FOOTAGE_OK=0
+    else
+        ok "no gap in any camera's footage since $(fmt_time "$DEPLOY_START")"
+    fi
 }
 
 # ── 1. target ─────────────────────────────────────────────────
@@ -119,6 +274,52 @@ if [ "$CURRENT" != "$TARGET" ]; then
     git log --format='      %h %s' "$CURRENT..$TARGET" | head -20
 fi
 echo ""
+
+# ── 1b. footage ───────────────────────────────────────────────
+reasons=""
+add_reason() { reasons="${reasons:+$reasons; }$*"; }
+changed=$(git diff --name-only "$CURRENT" "$TARGET" -- $REC_CONFIG)
+[ -n "$changed" ] && add_reason "its config ($REC_CONFIG, hot-reloaded)"
+changed=$(git diff --name-only "$CURRENT" "$TARGET" -- $REC_PROVISIONING)
+[ -n "$changed" ] && add_reason "how core provisions its paths ($(echo $changed))"
+running_hash=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$REC_CONTAINER" 2>/dev/null || true)
+if [ -n "$running_hash" ]; then
+    target_hash=$(recorder_target_hash)
+    if [ -z "$target_hash" ]; then
+        add_reason "its Compose definition, which did not render for $TAG"
+    elif [ "$target_hash" != "$running_hash" ]; then
+        add_reason "its Compose definition (Compose would recreate it)"
+    fi
+else
+    warn "the recorder ($REC_CONTAINER) isn't running; ./start.sh up will start it"
+fi
+if [ -n "$(git diff --name-only "$CURRENT" "$TARGET" -- $REC_IMAGE_CONTEXT)" ]; then
+    warn "$REC_IMAGE_CONTEXT changed: this script does not rebuild the recorder's image, so that change is not deployed"
+fi
+if [ -n "$reasons" ]; then
+    if [ "$ALLOW_RECORDER_RESTART" -eq 1 ]; then
+        warn "this update restarts or reconfigures the recorder: $reasons"
+        warn "every camera loses footage while it does (17 s each on 2026-10-19); --allow-recorder-restart accepts that"
+    else
+        die "this update would restart or reconfigure the recorder: $reasons.
+     Every camera loses footage while that happens (17 s each on 2026-10-19).
+     Deploy it when a gap is acceptable, with --allow-recorder-restart."
+    fi
+else
+    ok "recorder untouched: MediaMTX keeps recording through the deploy"
+fi
+RECORDING_BEFORE=$(recording_scan live | tr '\n' ' ') || die "could not read the recordings under $(env_get RECORDINGS_PATH)"
+if [ -n "$RECORDING_BEFORE" ]; then
+    ok "recording now: $(echo $RECORDING_BEFORE | wc -w | tr -d ' ') camera(s) ($(echo $RECORDING_BEFORE))"
+else
+    warn "no camera has written a segment in the last 30 s: check the recorder before deploying"
+fi
+echo ""
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    say "Checks only (--check): nothing changed."
+    exit 0
+fi
+
 if [ "$ASSUME_YES" -ne 1 ]; then
     read -rp "  Continue? [y/N]: " answer
     case "$answer" in y|Y|yes|YES) ;; *) say "Nothing changed."; exit 0 ;; esac
@@ -165,9 +366,12 @@ rollback() {
     fi
     ./start.sh up >>"$LOG" 2>&1
     echo -e "  ${RED}✗ deploy failed; rolled back to $(git rev-parse --short HEAD) ($(docker inspect -f '{{.Config.Image}}' "$CORE_CONTAINER" 2>/dev/null))${NC}" >&2
+    verify_footage
     exit 1
 }
 
+REC_BEFORE=$(recorder_identity)
+DEPLOY_START=$(date +%s)
 git merge --quiet --ff-only "$TARGET" || die "fast-forward failed — nothing was changed"
 env_set FORK_CORE_TAG "$TAG"
 ok "checkout at $(git rev-parse --short HEAD), FORK_CORE_TAG=$TAG"
@@ -190,4 +394,11 @@ while :; do
 done
 
 ok "core healthy on $IMAGE (database revision $(db_revision))"
+
+say "Checking the footage …"
+verify_footage
 echo ""
+if [ "$FOOTAGE_OK" -ne 1 ]; then
+    echo -e "  ${RED}✗ deployed, but the footage check above found a problem${NC}" >&2
+    exit 2
+fi

@@ -40,6 +40,7 @@ Then set `CORE_TAG=main` in `.env` and run `scripts/deploy.sh`.
 ## Deploying
 
 ```sh
+scripts/deploy.sh --check    # what a deploy of origin/main would do; changes nothing
 scripts/deploy.sh            # deploy origin/main (asks to confirm)
 scripts/deploy.sh --ref <sha> --yes
 ```
@@ -51,6 +52,38 @@ waits for core to report healthy. If any of that fails, it rolls back:
 previous commit and tag, the database restored from the backup if a
 migration ran, and `./start.sh up` again. See the header of
 `scripts/deploy.sh` for details.
+
+## Footage is never the price of a deploy
+
+MediaMTX writes every camera's footage, so anything that restarts or
+reconfigures it leaves a hole in all of them: 17 s per camera when the RTCP
+fix (PR #6) was deployed. Restarting core does not stop recording, and the
+segments written while it is down are indexed by its reconciler when it
+returns. `scripts/deploy.sh` therefore:
+
+1. **Refuses an update that would touch the recorder** unless it is run with
+   `--allow-recorder-restart`:
+   - its Compose definition: Compose's own config hash, rendered from the
+     target tree with the arguments `./start.sh up` uses, against the
+     running container's label;
+   - `mediamtx.docker.yml`, which MediaMTX hot-reloads;
+   - the core code that provisions its paths at startup:
+     `mediamtx_startup_service.py`, `mediamtx_admin_service.py`,
+     `stream_service.py`.
+
+   Run those deploys when a short gap is acceptable. A change under
+   `docker/mediamtx-build` is flagged but not deployed, because the script
+   never rebuilds the recorder's image.
+2. **Notes which cameras are recording** before it changes anything.
+3. **Checks the footage afterwards**, after a rollback too, by reading the
+   segment files on disk:
+   - the recorder is the same process;
+   - every camera that was recording still is;
+   - there is no gap over 3 s between segments since the deploy began.
+
+   If any of that fails it exits with status 2.
+
+`--check` runs steps 1 and 2 and the target checks, then stops.
 
 ## Taking upstream changes
 
