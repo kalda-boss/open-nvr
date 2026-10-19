@@ -37,13 +37,34 @@ import {
   Loader2,
   Film,
   Video,
+  Activity,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react'
 import { warmHls } from '../lib/loadHls'
-import { useCameraAspects, useRecordingsByDate, useSegmentsForCameras } from '../lib/queries'
+import {
+  MOTION_PRE_ROLL_MS,
+  combineMotion,
+  motionEvents,
+  nextMotionEvent,
+  parseMotion,
+  prevMotionEvent,
+  skipQuietTarget,
+  type MotionTrack,
+} from '../lib/motion'
+import {
+  useCameraAspects,
+  useMotionForCameras,
+  useRecordingsByDate,
+  useSegmentsForCameras,
+} from '../lib/queries'
 import { localDateKey, localDayEnd, localDayStart, todayLocalKey } from '../lib/time'
 import { useSnackbar } from '../components/Snackbar'
 import { useTranslation, useDateFormat, type DateFormatters } from '../i18n'
 import { RecordingCalendar } from '../components/RecordingCalendar'
+import { PaneResizer } from '../components/PaneResizer'
+import { useElementSize } from '../hooks/useElementSize'
+import { usePaneExtra } from '../hooks/usePaneExtra'
 import { MultiCamTimeline, type TimelineRow } from '../components/MultiCamTimeline'
 import { SyncPlaybackTile } from '../components/SyncPlaybackTile'
 import type { TimelineSegment } from '../components/PlaybackTimeline'
@@ -82,6 +103,11 @@ const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16]
 const RATE_1X = 2
 /** Grid limit — also keeps concurrent HLS sessions within the server cap. */
 const MAX_TILES = 4
+/** Least height the video wall keeps when the timeline pane is dragged
+ *  taller, and the most the pane may grow (a phone's page is not
+ *  height-bound, so nothing else stops it). */
+const MIN_GRID_PX = 160
+const MAX_PANE_EXTRA_PX = 480
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
 
@@ -122,7 +148,7 @@ function formatDateLong(date: string, fmt: DateFormatters) {
 export function SyncPlayback() {
   const fmt = useDateFormat()
   const { t } = useTranslation()
-  const { showError } = useSnackbar()
+  const { showError, showInfo } = useSnackbar()
   const stageRef = useRef<HTMLDivElement>(null)
   // Per-camera display-aspect settings for the grid tiles (#354).
   const cameraAspects = useCameraAspects()
@@ -310,6 +336,37 @@ export function SyncPlayback() {
   const segsLoading =
     selectedIds.length > 0 && segQueries.some((q) => q.isPending)
 
+  // ---- Motion activity (motion on each timeline row; jumps, skip-quiet) ----
+  // The shared playhead rides along so the server scores the clips around
+  // it first (none until the day has placed it).
+  const motionQueries = useMotionForCameras(selectedIds, selectedDate, previewMs ?? (masterMs || undefined))
+  const motionData0 = motionQueries[0]?.data
+  const motionData1 = motionQueries[1]?.data
+  const motionData2 = motionQueries[2]?.data
+  const motionData3 = motionQueries[3]?.data
+  const motionByCam = useMemo(() => {
+    const datas = [motionData0, motionData1, motionData2, motionData3]
+    const out: Record<number, MotionTrack | null> = {}
+    selectedIds.forEach((id, i) => {
+      out[id] = parseMotion(datas[i])
+    })
+    return out
+  }, [selectedIds, motionData0, motionData1, motionData2, motionData3])
+  // Every selected camera as one track: a jump stops for any of them.
+  const motion = useMemo(
+    () => combineMotion(selectedIds.map((id) => motionByCam[id]).filter((m): m is MotionTrack => !!m)),
+    [selectedIds, motionByCam]
+  )
+  const activity = useMemo(() => motionEvents(motion), [motion])
+  const [skipQuiet, setSkipQuiet] = useState(false)
+  // The master clock runs in an interval; it reads these through refs.
+  const skipRef = useRef({ on: false, motion, activity, endSaid: false })
+  skipRef.current.on = skipQuiet
+  skipRef.current.motion = motion
+  skipRef.current.activity = activity
+  const sayNoMoreRef = useRef(() => {})
+  sayNoMoreRef.current = () => showInfo(t('playback.noActivityAfter'))
+
   // Union of all selected cameras' footage — used for snapping, gap skipping
   // and picking the day's starting instant.
   const unionSegs = useMemo(() => {
@@ -361,6 +418,16 @@ export function SyncPlayback() {
           return
         }
       }
+      // Skip-quiet: past the end of a stretch of motion, go to the next one.
+      const sq = skipRef.current
+      if (sq.on && sq.motion) {
+        const target = skipQuietTarget(sq.motion, sq.activity, next)
+        if (typeof target === 'number') next = target
+        else if (target === 'end' && !sq.endSaid) {
+          sq.endSaid = true
+          sayNoMoreRef.current()
+        }
+      }
       // Never chase into footage still being written (or the end of the day).
       const cap = Math.min(Date.now() - 60_000, dayBoundsRef.current.end - 1)
       if (next >= cap) {
@@ -398,6 +465,7 @@ export function SyncPlayback() {
     const avail = (overview || []).filter((c) => c.recordings.some((r) => r.date === date)).map((c) => c.camera_id)
     setSelectedDate(date)
     dateInitRef.current = null
+    skipRef.current.endSaid = false
     setPlaying(false)
     setSelectedIds((prev) => {
       const kept = prev.filter((id) => avail.includes(id))
@@ -429,6 +497,17 @@ export function SyncPlayback() {
   }
 
   const togglePlay = () => setPlaying((p) => !p)
+
+  // Jump to the next / previous stretch of motion on any selected camera.
+  const jumpToActivity = (dir: 1 | -1) => {
+    const at = previewMs ?? masterMs
+    const ev = dir > 0 ? nextMotionEvent(activity, at) : prevMotionEvent(activity, at)
+    if (!ev) {
+      showInfo(t(dir > 0 ? 'playback.noActivityAfter' : 'playback.noActivityBefore'))
+      return
+    }
+    seekTo(ev.startMs - MOTION_PRE_ROLL_MS)
+  }
 
   const stop = () => {
     setPlaying(false)
@@ -502,12 +581,32 @@ export function SyncPlayback() {
         name: c.camera_name,
         segments: segsByCam[c.camera_id] || [],
         liveEdgeMs: liveEdges[c.camera_id] ?? null,
+        motion: motionByCam[c.camera_id] ?? null,
       })),
-    [selectedCams, segsByCam, liveEdges]
+    [selectedCams, segsByCam, liveEdges, motionByCam]
   )
 
   const effectiveCurrent = previewMs ?? masterMs
   const activeCam = selectedCams.find((c) => c.camera_id === activeId)
+
+  // ---- Resizable bottom pane ---------------------------------------------
+  // Dragging the transport bar's top edge up gives the timeline rows height
+  // the video wall gives up. The measured wall already excludes the extra it
+  // gave up last render, so that is added back to get the room.
+  const [gridRef, gridBox] = useElementSize<HTMLDivElement>()
+  const [paneExtra, setPaneExtra] = usePaneExtra('opennvr.syncplayback.timelineExtra')
+  const appliedExtraRef = useRef(0)
+  const gridRoom = Math.min(
+    MAX_PANE_EXTRA_PX,
+    gridBox.h + appliedExtraRef.current - MIN_GRID_PX
+  )
+  const paneExtraPx = Math.max(0, Math.min(paneExtra, gridRoom))
+  appliedExtraRef.current = paneExtraPx
+  const rowCount = timelineRows.length
+  const rowPx =
+    paneExtraPx > 0 && rowCount > 0
+      ? (rowCount > 2 ? 10 : 12) + paneExtraPx / rowCount
+      : undefined
 
   // ---- Render --------------------------------------------------------------
   // While the overview loads, the page frame renders immediately with
@@ -573,6 +672,7 @@ export function SyncPlayback() {
 
         {/* Video grid */}
         <div
+          ref={gridRef}
           className="flex-1 min-h-0 grid gap-px bg-[#1a1f29]"
           style={{
             gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
@@ -609,8 +709,17 @@ export function SyncPlayback() {
           )}
         </div>
 
-        {/* Transport controls */}
-        <div className="shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 border-t border-[var(--border)] flex-wrap">
+        {/* Transport controls. Their top edge is the bottom pane's: drag it
+            up for taller timeline rows. */}
+        <div className="relative shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 border-t border-[var(--border)] flex-wrap">
+          {timelineRows.length > 0 && view.end > view.start && (
+            <PaneResizer
+              value={paneExtraPx}
+              onChange={setPaneExtra}
+              max={() => gridRoom}
+              label={t('playback.resizeTimeline')}
+            />
+          )}
           <IconBtn title={playing ? 'Pause' : 'Play'} onClick={togglePlay}>
             {playing ? <Pause size={16} /> : <Play size={16} />}
           </IconBtn>
@@ -635,6 +744,43 @@ export function SyncPlayback() {
             <span className="text-[11px] text-[var(--text-dim)] truncate max-w-32" title={`Audio: ${activeCam.camera_name}`}>
               {activeCam.camera_name}
             </span>
+          )}
+
+          {motion && (
+            <div className="mx-1 flex items-center gap-0.5">
+              <IconBtn title={t('playback.prevActivity')} onClick={() => jumpToActivity(-1)}>
+                <ChevronLeft size={14} />
+              </IconBtn>
+              <button
+                title={t(skipQuiet ? 'playback.skipQuietOn' : 'playback.skipQuiet')}
+                aria-pressed={skipQuiet}
+                onClick={() => {
+                  skipRef.current.endSaid = false
+                  setSkipQuiet((on) => !on)
+                }}
+                className={`p-1 transition-colors ${
+                  skipQuiet
+                    ? 'bg-[var(--motion)] text-white'
+                    : 'text-[var(--motion)] hover:bg-[var(--panel)]'
+                }`}
+              >
+                <Activity size={14} />
+              </button>
+              <IconBtn title={t('playback.nextActivity')} onClick={() => jumpToActivity(1)}>
+                <ChevronRight size={14} />
+              </IconBtn>
+              {motion.pending > 0 && (
+                <span
+                  className="ml-0.5 flex items-center gap-1 text-[10px] font-mono tabular-nums text-[var(--text-dim)]"
+                  title={t('playback.motionScoringProgress', {
+                    percent: String(Math.floor(motion.progress * 100)),
+                  })}
+                >
+                  <Loader2 size={11} className="animate-spin" />
+                  {Math.floor(motion.progress * 100)}%
+                </span>
+              )}
+            </div>
           )}
 
           <div className="flex-1" />
@@ -679,6 +825,7 @@ export function SyncPlayback() {
                 onPan={panBy}
                 activeId={activeId}
                 onRowClick={setActiveId}
+                rowHeight={rowPx}
               />
             )}
           </div>

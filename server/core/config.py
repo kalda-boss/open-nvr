@@ -237,6 +237,14 @@ class Settings(BaseSettings):
     # this flag is the instant rollback switch for the cutover.
     use_db_recordings_index: bool = True
 
+    # Motion bar on the playback timeline (services/motion_index.py): score
+    # every recorded clip's motion from its keyframes in the background.
+    # Each worker is one niced ffmpeg on one core, about 1.2 s of CPU per
+    # minute of 4 MP HEVC footage; one worker keeps up with 25-40 cameras
+    # and backfills older footage with whatever is left.
+    motion_index_enabled: bool = True
+    motion_index_workers: int = 2
+
     # MediaMTX service URLs (internal - for backend to MediaMTX communication)
     mediamtx_hls_url: str | None = "http://localhost:8888"  # HLS streaming endpoint
     mediamtx_rtsp_url: str | None = "rtsp://localhost:8554"  # RTSP streaming endpoint

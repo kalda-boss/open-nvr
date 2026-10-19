@@ -38,7 +38,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import deferred, relationship
 from sqlalchemy.sql import func
 
 from core.config import settings
@@ -836,6 +836,13 @@ class Recording(Base):
         Index("ix_recordings_camera_start", "camera_id", "start_time"),
         Index("uq_recordings_camera_file", "camera_id", "file_path", unique=True),
         Index("ix_recordings_start_time", "start_time"),
+        # Only the clips the motion indexer has yet to score.
+        Index(
+            "ix_recordings_motion_pending",
+            "start_time",
+            postgresql_where=text("motion IS NULL"),
+            sqlite_where=text("motion IS NULL"),
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -855,6 +862,10 @@ class Recording(Base):
     is_flagged = Column(Boolean, nullable=False, default=False, server_default="false")
     # How the row entered the index: 'webhook' | 'reconciler'.
     source = Column(String(10), nullable=True)
+    # Per-second motion activity (services/motion_index.py): byte i scores
+    # second i of the clip. NULL until the indexer has scored it, empty when
+    # the file could not be read. Deferred: listings never need the bytes.
+    motion = deferred(Column(LargeBinary, nullable=True))
 
     camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=False)
     created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)

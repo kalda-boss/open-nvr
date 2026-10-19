@@ -18,7 +18,9 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { TimelineSegment } from './PlaybackTimeline'
+import { MotionLane } from './MotionLane'
 import { useEdgeAutoPan } from '../hooks/useEdgeAutoPan'
+import type { MotionTrack } from '../lib/motion'
 import { firstLocalTick } from '../lib/time'
 import { useTranslation, useDateFormat, type DateFormatters } from '../i18n'
 
@@ -27,6 +29,8 @@ export interface TimelineRow {
   name: string
   segments: TimelineSegment[]
   liveEdgeMs: number | null
+  /** Per-second motion activity (lib/motion.ts), drawn over the footage. */
+  motion?: MotionTrack | null
 }
 
 interface MultiCamTimelineProps {
@@ -47,6 +51,9 @@ interface MultiCamTimelineProps {
   /** Camera id whose row label is highlighted (audio/selection focus). */
   activeId?: number | null
   onRowClick?: (id: number) => void
+  /** Row height (px) when the player's pane was dragged taller; unset keeps
+   *  the thin default rows. */
+  rowHeight?: number
   className?: string
 }
 
@@ -91,6 +98,7 @@ const TrackRow = memo(function TrackRow({
   viewStart,
   viewEnd,
   rowH,
+  rowPx,
   active,
   onRowClick,
 }: {
@@ -98,6 +106,7 @@ const TrackRow = memo(function TrackRow({
   viewStart: number
   viewEnd: number
   rowH: string
+  rowPx?: number
   active: boolean
   onRowClick?: (id: number) => void
 }) {
@@ -128,6 +137,27 @@ const TrackRow = memo(function TrackRow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [row.segments, row.liveEdgeMs, viewStart, viewEnd])
 
+  const footage = (
+    <>
+      {blocks.map((b, i) => (
+        <div
+          key={i}
+          className="absolute top-0 bottom-0"
+          style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--accent)' }}
+        />
+      ))}
+      {liveBlocks.map((b, i) => (
+        <div
+          key={`live-${i}`}
+          className="absolute top-0 bottom-0"
+          style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--ok)' }}
+        />
+      ))}
+    </>
+  )
+  // A row dragged tall enough splits into motion lane + footage strip.
+  const split = !!row.motion && (rowPx ?? 0) >= 32
+
   return (
     <div className="flex items-center">
       <button
@@ -141,21 +171,42 @@ const TrackRow = memo(function TrackRow({
       >
         {row.name}
       </button>
-      <div className={`flex-1 relative ${rowH} bg-[var(--panel-2)] overflow-hidden`}>
-        {blocks.map((b, i) => (
-          <div
-            key={i}
-            className="absolute top-0 bottom-0"
-            style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--accent)' }}
-          />
-        ))}
-        {liveBlocks.map((b, i) => (
-          <div
-            key={`live-${i}`}
-            className="absolute top-0 bottom-0"
-            style={{ left: `${b.left}%`, width: `${b.width}%`, background: 'var(--ok)' }}
-          />
-        ))}
+      <div
+        className={`flex-1 relative ${rowPx ? '' : rowH} bg-[var(--panel-2)] overflow-hidden ${
+          split ? 'flex flex-col' : ''
+        }`}
+        style={rowPx ? { height: rowPx } : undefined}
+      >
+        {split && row.motion ? (
+          <>
+            {/* Room for it: a motion lane over a thin footage strip, as in
+                the single-camera player. */}
+            <div className="relative flex-1 min-h-0">
+              <MotionLane
+                track={row.motion}
+                viewStart={viewStart}
+                viewEnd={viewEnd}
+                aria-hidden
+                className="absolute inset-0 w-full h-full bg-[var(--panel)]"
+              />
+            </div>
+            <div className="relative shrink-0 h-2.5">{footage}</div>
+          </>
+        ) : (
+          <>
+            {footage}
+            {row.motion && (
+              <MotionLane
+                track={row.motion}
+                viewStart={viewStart}
+                viewEnd={viewEnd}
+                variant="overlay"
+                aria-hidden
+                className="absolute inset-0 w-full h-full pointer-events-none"
+              />
+            )}
+          </>
+        )}
       </div>
     </div>
   )
@@ -178,6 +229,7 @@ export function MultiCamTimeline({
   onPan,
   activeId = null,
   onRowClick,
+  rowHeight,
   className = '',
 }: MultiCamTimelineProps) {
   const fmt = useDateFormat()
@@ -351,6 +403,7 @@ export function MultiCamTimeline({
               viewStart={viewStart}
               viewEnd={viewEnd}
               rowH={rowH}
+              rowPx={rowHeight}
               active={row.id === activeId}
               onRowClick={onRowClick}
             />

@@ -20,11 +20,12 @@
 // these instead of calling apiService in a useEffect, so concurrent mounts
 // share one request and one cache entry.
 
-import { useMemo } from 'react'
+import { useMemo, useRef } from 'react'
 import { QueryClient, keepPreviousData, useQueries, useQuery } from '@tanstack/react-query'
 import { apiService } from './apiService'
 import type { AspectOverride } from './aspect'
 import type { FisheyeLens } from './fisheye'
+import type { MotionResponse } from './motion'
 import { todayLocalKey } from './time'
 import { alertsInboxService, type InboxAlert } from '../services/alertsInboxService'
 
@@ -204,6 +205,59 @@ export function useCameraSegments(
     // Only today's timeline grows; historical days never change.
     refetchInterval: polling ? opts.pollMs ?? 15_000 : false,
     staleTime: polling ? 5_000 : 60_000,
+  })
+}
+
+/**
+ * Per-second motion activity for one camera's LOCAL day (lib/motion.ts).
+ *
+ * While the server is still scoring the day it is re-polled every few
+ * seconds, so the bar fills in as clips are scored; `focusMs` (the
+ * playhead) rides along un-keyed, steering which clips go first without
+ * forking the cache entry. Today keeps growing, so it re-polls slowly;
+ * a finished past day never refetches.
+ */
+export function useCameraMotion(cameraId: number, date: string | null, focusMs?: number) {
+  const focusRef = useRef(focusMs)
+  focusRef.current = focusMs
+  const isToday = date === todayLocalKey()
+  return useQuery({
+    queryKey: ['motion', cameraId, date],
+    enabled: cameraId > 0 && !!date,
+    queryFn: async () => {
+      const { data } = await apiService.getMotion(cameraId, date as string, focusRef.current)
+      return data as MotionResponse
+    },
+    refetchInterval: (q) => {
+      const d = q.state.data as MotionResponse | undefined
+      if (d?.enabled && d.pending > 0) return 4_000
+      return isToday ? 60_000 : false
+    },
+    staleTime: isToday ? 10_000 : 5 * 60_000,
+  })
+}
+
+/** useCameraMotion for the sync playback grid: one query per camera, the
+ *  same cache entries as the single-camera console. */
+export function useMotionForCameras(cameraIds: number[], date: string | null, focusMs?: number) {
+  const focusRef = useRef(focusMs)
+  focusRef.current = focusMs
+  const isToday = date === todayLocalKey()
+  return useQueries({
+    queries: cameraIds.map((id) => ({
+      queryKey: ['motion', id, date],
+      enabled: id > 0 && !!date,
+      queryFn: async () => {
+        const { data } = await apiService.getMotion(id, date as string, focusRef.current)
+        return data as MotionResponse
+      },
+      refetchInterval: (q: { state: { data?: MotionResponse } }) => {
+        const d = q.state.data
+        if (d?.enabled && d.pending > 0) return 4_000
+        return isToday ? 60_000 : (false as const)
+      },
+      staleTime: isToday ? 10_000 : 5 * 60_000,
+    })),
   })
 }
 
