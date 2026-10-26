@@ -25,6 +25,7 @@ import {
 import { useTranslation } from '../../i18n'
 import type { DewarpMode } from '../../lib/fisheye'
 import { DewarpMenu } from './DewarpMenu'
+import { TalkButton } from './TalkButton'
 
 export interface VideoControlsProps {
   videoRef: React.RefObject<HTMLVideoElement | null>
@@ -52,6 +53,8 @@ export interface VideoControlsProps {
   /** Present only when the camera supports PTZ; toggles the PTZ pad */
   onTogglePtz?: () => void
   ptzActive?: boolean
+  /** Live camera to offer push-to-talk for; the button hides itself when it can't talk. */
+  talkCameraId?: number | null
   /** Fisheye layouts on offer; empty (the default) hides the picker. */
   dewarpModes?: DewarpMode[]
   dewarpMode?: DewarpMode
@@ -84,6 +87,7 @@ export function VideoControls({
   availableStreamTypes = [],
   onTogglePtz,
   ptzActive = false,
+  talkCameraId = null,
   dewarpModes = [],
   dewarpMode = 'fisheye',
   onDewarpModeChange,
@@ -255,6 +259,9 @@ export function VideoControls({
             <Move size={18} />
           </button>
         )}
+
+        {/* Talk (live only, cameras with a reachable speaker only) */}
+        {isLive && talkCameraId != null && <TalkButton cameraId={talkCameraId} />}
 
         {/* Volume */}
         <div

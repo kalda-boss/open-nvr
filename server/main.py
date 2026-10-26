@@ -67,6 +67,7 @@ from routers import (
     camera_config,
     camera_settings,
     cameras,
+    talkback,
     app_platform,
     internal_camera_agent,
     search,
@@ -1052,6 +1053,7 @@ app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(users.router, prefix=settings.api_prefix)
 app.include_router(cameras.router, prefix=settings.api_prefix)
 app.include_router(camera_settings.router, prefix=settings.api_prefix)
+app.include_router(talkback.router, prefix=settings.api_prefix)
 app.include_router(internal_camera_agent.router, prefix=settings.api_prefix)
 # The app platform door (snapshot, recordings, plates, alerts, state) —
 # app-key scoped; see routers/app_platform.py and docs/APP_PLATFORM.md.
