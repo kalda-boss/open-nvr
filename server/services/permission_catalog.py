@@ -45,6 +45,14 @@ NEW_PERMISSIONS_HA: tuple[NewPermission, ...] = (
 )
 
 
+#: Camera talk-back. A new ability (speaking out of a camera's speaker
+#: reaches people on site), so no backfill: admins get it via full_access
+#: and a role gets it only when an administrator grants it.
+NEW_PERMISSIONS_TALK: tuple[NewPermission, ...] = (
+    NewPermission("talk.speak", "Speak through camera speakers (talk-back)"),
+)
+
+
 #: Earlier late additions, seeded the same way (kept here so every
 #: upgrade-path permission lives in one list).
 _EARLIER_LATE_PERMISSIONS: tuple[NewPermission, ...] = (
@@ -58,6 +66,7 @@ _EARLIER_LATE_PERMISSIONS: tuple[NewPermission, ...] = (
 UPGRADE_PATH_PERMISSIONS: tuple[NewPermission, ...] = (
     *_EARLIER_LATE_PERMISSIONS,
     *NEW_PERMISSIONS_HA,
+    *NEW_PERMISSIONS_TALK,
 )
 
 

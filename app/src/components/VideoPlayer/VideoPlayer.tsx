@@ -1290,6 +1290,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             availableStreamTypes={availableStreamTypes}
             onTogglePtz={onTogglePtz}
             ptzActive={ptzActive}
+            talkCameraId={mode === 'live' ? cameraId : null}
             dewarpModes={dewarp.modes}
             dewarpMode={dewarp.mode}
             onDewarpModeChange={dewarp.setMode}
