@@ -1096,6 +1096,7 @@ export function AddCameraDialog({
                 <input
                   type="text"
                   className="bg-[var(--bg-2)] border border-[var(--border)] px-3 py-2 text-sm"
+                  autoComplete="off"
                   value={credentials.username}
                   onChange={(e) => handleCredentialsChange({ username: e.target.value })}
                 />
@@ -1106,6 +1107,7 @@ export function AddCameraDialog({
                   type="password"
                   className="bg-[var(--bg-2)] border border-[var(--border)] px-3 py-2 text-sm"
                   placeholder="Leave blank if none"
+                  autoComplete="new-password"
                   autoFocus
                   value={credentials.password}
                   onChange={(e) => handleCredentialsChange({ password: e.target.value })}
@@ -1275,6 +1277,7 @@ export function AddCameraDialog({
                   type="text"
                   className="bg-[var(--bg-2)] border border-[var(--border)] px-3 py-2 text-sm"
                   placeholder="admin"
+                  autoComplete="off"
                   value={form.username}
                   onChange={(e) => setForm(f => ({ ...f, username: e.target.value }))}
                   onBlur={() => syncIdentity('username')}
@@ -1285,6 +1288,7 @@ export function AddCameraDialog({
                 <input
                   type="password"
                   className="bg-[var(--bg-2)] border border-[var(--border)] px-3 py-2 text-sm"
+                  autoComplete="new-password"
                   value={form.password}
                   onChange={(e) => setForm(f => ({ ...f, password: e.target.value }))}
                   onBlur={() => syncIdentity('password')}

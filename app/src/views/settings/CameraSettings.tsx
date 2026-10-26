@@ -371,6 +371,7 @@ function UsersTab({ cameraId }: { cameraId: number }) {
           <input
             className={INPUT_CLS}
             placeholder="Username"
+            autoComplete="off"
             value={form.username}
             onChange={(e) => setForm({ ...form, username: e.target.value })}
           />
@@ -378,6 +379,7 @@ function UsersTab({ cameraId }: { cameraId: number }) {
             className={INPUT_CLS}
             type="password"
             placeholder="Password"
+            autoComplete="new-password"
             value={form.password}
             onChange={(e) => setForm({ ...form, password: e.target.value })}
           />
