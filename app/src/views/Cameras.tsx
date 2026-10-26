@@ -893,11 +893,16 @@ export function Cameras() {
                   title="Kept in step with the port in the RTSP URL below"
                 />
               </Field>
+              {/* These are the CAMERA's credentials, never the operator's. Without
+                  autoComplete a browser password manager fills in the saved
+                  OpenNVR login, the blur sync writes it into both stream URLs,
+                  and saving any unrelated edit (a rename) cuts recording with a
+                  401 from the camera. */}
               <Field label="Username">
-                <Input value={form.username || ''} onChange={(e) => setForm({ ...form, username: e.target.value })} onBlur={() => syncIdentity('username')} />
+                <Input autoComplete="off" value={form.username || ''} onChange={(e) => setForm({ ...form, username: e.target.value })} onBlur={() => syncIdentity('username')} />
               </Field>
               <Field label="Password">
-                <Input type="password" value={form.password || ''} onChange={(e) => setForm({ ...form, password: e.target.value })} onBlur={() => syncIdentity('password')} placeholder="Leave blank to keep existing" />
+                <Input type="password" autoComplete="new-password" value={form.password || ''} onChange={(e) => setForm({ ...form, password: e.target.value })} onBlur={() => syncIdentity('password')} placeholder="Leave blank to keep existing" />
               </Field>
               <Field label="Location">
                 <Input value={form.location || ''} onChange={(e) => setForm({ ...form, location: e.target.value })} />
