@@ -85,6 +85,52 @@ returns. `scripts/deploy.sh` therefore:
 
 `--check` runs steps 1 and 2 and the target checks, then stops.
 
+## Reading the recorder's log
+
+Most of `docker logs opennvr_mediamtx` is this line, once a second for each
+of cameras 1–4 and 6–9 (as of October 2026), with a count usually between
+8 and 15:
+
+    WAR [path cam-3] [RTSP source] 13 decode errors
+
+It is harmless. Those cameras (Uniview firmware) slip small vendor-data
+packets into the video stream with RTP payload type 50, which their SDP
+never declares (the video is payload type 108, H.265). MediaMTX's RTSP
+client drops each one, reporting
+`received RTP packet with unknown payload type: 50`, and counts it as a
+decode error. The packets hold no picture data: each sits between two
+frames and reuses the next video packet's sequence number, so the video
+has no sequence gaps and nothing is counted as lost. Cameras 5 and 10
+don't send them.
+
+Checked on 2026-10-26: read directly with the same RTSP client (gortsplib
+v5.2.0), every camera's video had no sequence gaps or broken fragments and
+decoded cleanly, and 30 recorded segments, from every camera by day and by
+night, had every frame, no gaps and no decoder errors.
+
+Signs of a real problem:
+
+- `RTP packets lost`, `processing errors` or
+  `received too late, discarding` lines;
+- decode errors from camera 5 or 10, or counts well above 20;
+- gaps between segments;
+- anything besides the frame count from
+
+  ```sh
+  ffprobe -v error -count_frames -select_streams v:0 \
+    -show_entries stream=nb_read_frames -of csv=p=0 <segment>.mp4
+  ```
+
+  (about 600 for a 60 s segment at 10 fps, 1,500 at 25 fps). Don't use
+  `ffmpeg ... -f null -` for this: its muxer complains about rounded
+  timestamps on healthy segments.
+
+The noise does cost log history. It is about 90 % of MediaMTX's log, which
+Compose caps at 3 × 10 MB, so `docker logs` only reaches back about six
+hours; `grep -v 'decode errors'` shows the rest. Removing it for good
+means patching MediaMTX or raising its log cap, and either one restarts
+the recorder (see above).
+
 ## Taking upstream changes
 
 In a development clone (not the live checkout):
