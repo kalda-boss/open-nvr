@@ -105,6 +105,9 @@ from routers import (
 )
 from scripts.init_db import create_initial_data
 from services.mediamtx_admin_service import MediaMtxAdminService as _MtxAdmin
+from services.startup_provisioning import ProvisionJob as _ProvisionJob
+from services.startup_provisioning import provision_pass as _provision_pass
+from services.startup_provisioning import retry_failed as _retry_failed
 
 # The OpenNVR release this build is cut from. Surfaced in /health and in the
 # OpenAPI schema, and quoted in bug reports (see SECURITY.md) — so it tracks the
@@ -339,8 +342,50 @@ async def lifespan(app: FastAPI):
 
     # Auto-provision MediaMTX paths from stored configs (if admin API configured)
     # This runs in background to avoid blocking application startup
+    def _load_provision_jobs(camera_ids=None):
+        """Provisioning jobs from the DB; ``camera_ids`` narrows a retry round."""
+        db = SessionLocal()
+        try:
+            # Paused (is_active=False) and binned (deleted_at set)
+            # cameras must stay unprovisioned across restarts —
+            # deactivate/delete tear their MediaMTX path down and this
+            # loop must not resurrect it.
+            query = (
+                db.query(_CameraConfig, _Camera)
+                .join(_Camera, _Camera.id == _CameraConfig.camera_id)
+                .filter(_Camera.is_active == True)
+                .filter(_Camera.deleted_at.is_(None))
+            )
+            if camera_ids is not None:
+                query = query.filter(_Camera.id.in_(camera_ids))
+
+            jobs = []
+            for cfg, cam in query.all():
+                payload = {
+                    # The camera row wins over the config row. cfg.source_url
+                    # is a snapshot taken when the camera was first
+                    # provisioned; reading it here is what used to revert an
+                    # edited RTSP URL on every restart. Keeping it as the
+                    # fallback lets this loop self-heal rows that drifted
+                    # before the edit path started syncing it — no migration.
+                    "source_url": cam.rtsp_url or cfg.source_url,
+                    # Without this key _provision_substream falls back to
+                    # deriving the sub URL from vendor convention, silently
+                    # discarding an operator-stored one on every restart.
+                    "substream_url": cam.substream_url,
+                    "rtsp_transport": cfg.rtsp_transport,
+                    "recording_enabled": cfg.recording_enabled,
+                    "recording_path": cfg.recording_path,
+                    "recording_segment_seconds": cfg.recording_segment_seconds,
+                }
+                jobs.append(_ProvisionJob(cam.id, cam.ip_address, payload))
+            return jobs
+        finally:
+            db.close()
+
     async def background_mediamtx_provisioning():
         """Background task for MediaMTX provisioning that doesn't block startup."""
+        failed = []
         try:
             if settings.mediamtx_admin_api and settings.mediamtx_auto_provision:
                 main_logger.info(
@@ -352,80 +397,9 @@ async def lifespan(app: FastAPI):
 
                 await asyncio.sleep(2)
 
-                db = SessionLocal()
-                try:
-                    # Paused (is_active=False) and binned (deleted_at set)
-                    # cameras must stay unprovisioned across restarts —
-                    # deactivate/delete tear their MediaMTX path down and this
-                    # loop must not resurrect it.
-                    rows = (
-                        db.query(_CameraConfig, _Camera)
-                        .join(_Camera, _Camera.id == _CameraConfig.camera_id)
-                        .filter(_Camera.is_active == True)
-                        .filter(_Camera.deleted_at.is_(None))
-                        .all()
-                    )
-                    provisioned_count = 0
-                    failed_count = 0
-
-                    for cfg, cam in rows:
-                        payload = {
-                            # The camera row wins over the config row. cfg.source_url
-                            # is a snapshot taken when the camera was first
-                            # provisioned; reading it here is what used to revert an
-                            # edited RTSP URL on every restart. Keeping it as the
-                            # fallback lets this loop self-heal rows that drifted
-                            # before the edit path started syncing it — no migration.
-                            "source_url": cam.rtsp_url or cfg.source_url,
-                            # Without this key _provision_substream falls back to
-                            # deriving the sub URL from vendor convention, silently
-                            # discarding an operator-stored one on every restart.
-                            "substream_url": cam.substream_url,
-                            "rtsp_transport": cfg.rtsp_transport,
-                            "recording_enabled": cfg.recording_enabled,
-                            "recording_path": cfg.recording_path,
-                            "recording_segment_seconds": cfg.recording_segment_seconds,
-                        }
-                        try:
-                            # upsert, not add: when MediaMTX outlives a server
-                            # restart every path already exists, and a plain add
-                            # leaves each one on whatever config it had.
-                            res = await _MtxAdmin.upsert_path(
-                                cam.id, cam.ip_address, payload
-                            )
-                            # The service returns "ok", never "success" — this
-                            # counter used to log 0 successes on every startup.
-                            if res.get("status") == "ok":
-                                provisioned_count += 1
-                            else:
-                                failed_count += 1
-
-                            main_logger.log_action(
-                                "mediamtx.path_provision",
-                                camera_id=cam.id,
-                                message=f"MediaMTX path provisioned: path={res.get('path')} status={res.get('status')} http={res.get('http_status')}",
-                                extra_data={"provision_result": res},
-                            )
-                        except Exception as e:
-                            failed_count += 1
-                            main_logger.warning(
-                                f"[MTX] provision error camera_id={cam.id}: {e}",
-                                extra={"camera_id": cam.id},
-                            )
-                            # Don't log full traceback for connection errors to reduce noise
-                            if "ConnectionError" not in str(type(e)):
-                                main_logger.error(
-                                    f"[MTX] Unexpected error camera_id={cam.id}: {e}",
-                                    extra={"camera_id": cam.id},
-                                    exc_info=True,
-                                )
-
-                    main_logger.info(
-                        f"[MTX] Background provisioning completed: {provisioned_count} success, {failed_count} failed"
-                    )
-
-                finally:
-                    db.close()
+                failed = await _provision_pass(
+                    _load_provision_jobs(), _MtxAdmin.upsert_path
+                )
             else:
                 if not settings.mediamtx_admin_api:
                     main_logger.info(
@@ -448,6 +422,16 @@ async def lifespan(app: FastAPI):
                 await restore_on_startup()
             except Exception as e:  # noqa: BLE001
                 main_logger.error(f"[MTX] recording-pause restore failed: {e}",
+                                  exc_info=True)
+
+        # After the restore, so minutes of retries don't hold up an overdue
+        # resume. A camera that failed here has no path: no live view and
+        # no recording until a retry lands.
+        if failed:
+            try:
+                await _retry_failed(failed, _load_provision_jobs, _MtxAdmin.upsert_path)
+            except Exception as e:  # noqa: BLE001
+                main_logger.error(f"[MTX] Provisioning retry failed: {e}",
                                   exc_info=True)
 
     # Start background provisioning task
