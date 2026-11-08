@@ -24,6 +24,7 @@ import {
   useImperativeHandle,
   useCallback,
   useMemo,
+  useLayoutEffect,
 } from 'react'
 import { apiService } from '../../lib/apiService'
 import type Hls from 'hls.js'
@@ -65,8 +66,12 @@ export interface VideoPlayerProps {
   title?: string
   /** Auto play on load */
   autoPlay?: boolean
-  /** Start muted */
+  /** Muted. Read at mount; a later change mutes or unmutes the playing
+   *  element in place (inside the click that caused it, so iOS allows sound). */
   muted?: boolean
+  /** The element's muted state changed: the user, the controls, or the
+   *  browser refusing to autoplay with sound (which falls back to muted). */
+  onMutedChange?: (muted: boolean) => void
   /** CSS class */
   className?: string
   /** Callback when snapshot is taken */
@@ -135,6 +140,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       onSnapshot,
       onError,
       onAuthExpired,
+      onMutedChange,
       onHlsPlaybackError,
       onTogglePtz,
       ptzActive = false,
@@ -195,6 +201,28 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     // rebuild the stream on every parent render.
     const onAuthExpiredRef = useRef(onAuthExpired)
     onAuthExpiredRef.current = onAuthExpired
+    const onMutedChangeRef = useRef(onMutedChange)
+    onMutedChangeRef.current = onMutedChange
+
+    // Follow the `muted` prop after mount. A layout effect, so a click's
+    // re-render applies it before the click's event dispatch ends: iOS only
+    // lets a page start sound from inside a user gesture.
+    const mutedPropRef = useRef(muted)
+    useLayoutEffect(() => {
+      if (mutedPropRef.current === muted) return
+      mutedPropRef.current = muted
+      const el = videoRef.current
+      if (!el) return
+      el.muted = muted
+      if (!muted) {
+        if (el.volume === 0) el.volume = 1
+        // Only a refusal to play with sound mutes it again; a stream that
+        // hasn't arrived yet will be played, unmuted, when it does.
+        if (el.paused && (el.srcObject || el.currentSrc)) {
+          el.play().catch((e) => { if (e?.name === 'NotAllowedError') el.muted = true })
+        }
+      }
+    }, [muted])
     const [isReconnecting, setIsReconnecting] = useState(false)
     // Coded frame size of the incoming stream, read from the video metadata.
     // null until known (or after the source is torn down).
@@ -428,8 +456,16 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             // Clear any existing error when we get a valid stream
             offlinePollingRef.current = false
             setError(null)
-            videoRef.current.srcObject = stream
-            videoRef.current.play().catch(() => {})
+            const el = videoRef.current
+            el.srcObject = stream
+            // A browser that won't autoplay with sound (iOS outside a tap)
+            // rejects play() and would leave the picture paused: fall back
+            // to muted, which every browser allows.
+            el.play().catch((e) => {
+              if (e?.name !== 'NotAllowedError' || el.muted) return
+              el.muted = true
+              el.play().catch(() => {})
+            })
             setIsLoading(false)
           }
         }
@@ -843,6 +879,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       const onVolumeChange = () => {
         setIsMuted(el.muted)
         setVolume(el.volume)
+        onMutedChangeRef.current?.(el.muted)
       }
       const onProgress = () => {
         if (el.buffered.length > 0) {
