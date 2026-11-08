@@ -281,19 +281,12 @@ class HlsPlaybackService:
             except Exception:
                 conflicted = False
 
-        # Query MediaMTX for segment info
         if conflicted:
             recording_logger.warning(
                 f"[HLS] Camera {camera_id}: dir identity conflict — serving "
                 "empty session instead of another camera's footage"
             )
-            segments, total_duration = [], 0.0
-        else:
-            segments, total_duration = await cls._fetch_segments(
-                camera_path, start_time, end_time
-            )
 
-        # Create session
         session = PlaybackSession(
             session_id=session_id,
             user_id=user_id,
@@ -304,23 +297,33 @@ class HlsPlaybackService:
             end_time=end_time,
             created_at=now,
             expires_at=now + ttl,
-            segments=segments,
-            total_duration=total_duration,
         )
 
-        # Try the fast byte-range path: resolve the single on-disk file covering
-        # this window and index its fragments. Any failure leaves the session on
-        # the MediaMTX proxy path (byte_segments stays empty). Runs off the event
-        # loop since it does blocking file I/O.
-        try:
-            if not conflicted:
+        if not conflicted:
+            # Fast path first: resolve the on-disk clips from the recordings DB
+            # index and map their fragments. Runs off the event loop (blocking
+            # file I/O). Any failure leaves session.files empty.
+            try:
                 await asyncio.to_thread(
-                    cls._attach_byte_index, session, camera_id, db, total_duration
+                    cls._attach_byte_index, session, camera_id, db, 0.0
                 )
-        except Exception as e:
-            recording_logger.warning(
-                f"[HLS] Byte-range indexing failed, using MediaMTX fallback: {e}"
-            )
+            except Exception as e:
+                recording_logger.warning(
+                    f"[HLS] Byte-range indexing failed, using MediaMTX fallback: {e}"
+                )
+
+            # Only ask MediaMTX's /list when the index had nothing. /list walks
+            # the camera's whole recordings tree (tens of thousands of clips on
+            # a large archive) and can take longer than its own 30 s timeout,
+            # so calling it up front made every playback start wait on it, then
+            # get cancelled by the browser, even though the byte-range path
+            # never uses its result.
+            if not session.files:
+                segments, total_duration = await cls._fetch_segments(
+                    camera_path, start_time, end_time
+                )
+                session.segments = segments
+                session.total_duration = total_duration
 
         # Store session
         async with cls._lock:
@@ -331,7 +334,7 @@ class HlsPlaybackService:
 
         recording_logger.info(
             f"[HLS] Created session {session_id[:8]}... for user={username}, "
-            f"camera={camera_id}, duration={total_duration:.1f}s"
+            f"camera={camera_id}, duration={session.total_duration:.1f}s"
         )
 
         return session
