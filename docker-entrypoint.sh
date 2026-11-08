@@ -52,9 +52,24 @@ fi
 # files are fine; this migrates whatever an older stack left behind. Scoped
 # to files NOT already owned by opennvr, so on a healthy tree it is a
 # metadata-only scan, not a full re-chown.
+#
+# Probe one file first. On a host bind mount that doesn't keep ownership
+# (Docker Desktop's virtiofs, where every file shows as root whatever chown
+# does), the walk can never succeed and only grows with the archive: about
+# 330k clips on an external USB drive kept core from starting for many
+# minutes on every restart, past deploy.sh's health wait. Such mounts
+# already let uid 1000 delete files, so there is nothing to migrate.
 if [ -d "/app/recordings" ]; then
-    echo "Fixing ownership of non-opennvr files in recordings tree..."
-    find /app/recordings ! -user opennvr -exec chown opennvr:opennvr {} + 2>/dev/null || true
+    probe=$(find /app/recordings ! -user opennvr -print -quit 2>/dev/null)
+    if [ -z "$probe" ]; then
+        :  # nothing to fix
+    elif chown opennvr:opennvr "$probe" 2>/dev/null \
+        && [ "$(stat -c %U "$probe" 2>/dev/null)" = "opennvr" ]; then
+        echo "Fixing ownership of non-opennvr files in recordings tree..."
+        find /app/recordings ! -user opennvr -exec chown opennvr:opennvr {} + 2>/dev/null || true
+    else
+        echo "Recordings mount does not keep file ownership; skipping chown walk."
+    fi
 fi
 
 # ──────────────────────────────────────────────────────────────────────
