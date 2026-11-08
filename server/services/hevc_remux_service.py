@@ -46,11 +46,14 @@ it is kept as the reference implementation (test oracle) and for tooling.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import struct
+import threading
 from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -253,24 +256,44 @@ class RemuxIndex:
     """The complete recipe for the browser-playable MP4 of one recording.
 
     ``header`` is the synthesized ``ftyp + moov + mdat-header`` prefix; output
-    bytes beyond it are the source file's video sample runs, in order.
+    bytes beyond it are the source files' video sample runs, in order.
     ``run_out_starts[i]`` is the absolute OUTPUT offset where ``runs[i]``
     begins (first entry == len(header)), enabling O(log n) range mapping.
     """
 
+    src_path: str  # the first source file
+    src_size: int  # of the first file (cache currency check)
+    src_mtime: int
+    header: bytes
+    runs: tuple[tuple[int, int, int], ...]  # (file_no, source_offset, length)
+    run_out_starts: tuple[int, ...]
+    total_size: int
+    # Every source file, in output order; ``runs`` index into this. A chained
+    # index (``build_chain_index``) plays several consecutive recordings as
+    # one continuous video.
+    src_paths: tuple[str, ...] = ()
+    duration: float = 0.0  # seconds of video
+
+
+@dataclass(frozen=True)
+class _VideoScan:
+    """Headers-only scan of one recording's video track (see ``_scan_video``)."""
+
     src_path: str
     src_size: int
     src_mtime: int
-    header: bytes
+    timescale: int
+    stsd_entry: bytes  # retagged sample entry
+    sample_sizes: tuple[int, ...]
+    sample_durs: tuple[int, ...]
+    sync_samples: tuple[int, ...]  # 1-based, within this file
     runs: tuple[tuple[int, int], ...]  # (source_offset, length)
-    run_out_starts: tuple[int, ...]
-    total_size: int
 
 
-def build_remux_index(src_path: str | Path) -> RemuxIndex:
-    """Scan ``src_path`` (headers only — sample payloads are never read) and
-    build the :class:`RemuxIndex` for its flat, video-only remux
-    (``hev1`` retagged to ``hvc1``, any other sample entry kept).
+def _scan_video(src_path: str | Path) -> _VideoScan:
+    """Scan ``src_path``'s video track (headers only — sample payloads are
+    never read): sample sizes, durations, sync samples and the byte runs that
+    hold them, plus the retagged sample entry (``hev1`` -> ``hvc1``).
 
     Raises on structural failure (caller treats the file as unplayable).
     """
@@ -422,6 +445,49 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
         if not sample_sizes:
             raise ValueError("no video samples")
 
+    return _VideoScan(
+        src_path=os.path.abspath(src_path),
+        src_size=st.st_size,
+        src_mtime=int(st.st_mtime),
+        timescale=timescale,
+        stsd_entry=bytes(stsd_entry),
+        sample_sizes=tuple(sample_sizes),
+        sample_durs=tuple(sample_durs),
+        sync_samples=tuple(sync_samples),
+        runs=tuple(runs),
+    )
+
+
+# A gap between consecutive recordings longer than this is not bridged.
+MAX_GAP_FILL_SECONDS = 2.5
+
+
+def _assemble(scans: list[_VideoScan], spans: list[float] | None = None) -> RemuxIndex:
+    """Build the flat, video-only MP4 recipe that plays ``scans`` back to back.
+
+    ``spans[i]`` is the wall-clock time from file i's start to file i+1's.
+    When a file's video is a little shorter than that (a small recording
+    gap), its last frame is held to fill it, so video time stays aligned with
+    wall-clock time across the whole chain.
+    """
+    first = scans[0]
+    timescale = first.timescale
+    stsd_entry = first.stsd_entry
+    sample_sizes: list[int] = []
+    sample_durs: list[int] = []
+    sync_samples: list[int] = []
+    runs: list[tuple[int, int, int]] = []
+    for no, sc in enumerate(scans):
+        base = len(sample_sizes)
+        sample_sizes.extend(sc.sample_sizes)
+        sample_durs.extend(sc.sample_durs)
+        sync_samples.extend(base + n for n in sc.sync_samples)
+        runs.extend((no, off, ln) for off, ln in sc.runs)
+        if spans is not None and no < len(spans):
+            fill = round(spans[no] * timescale) - sum(sc.sample_durs)
+            if 0 < fill <= MAX_GAP_FILL_SECONDS * timescale:
+                sample_durs[-1] += fill
+
     total_dur = sum(sample_durs)
 
     # -- build moov (video-only) --
@@ -469,7 +535,7 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
     ftyp = _box(b"ftyp", b"isom" + struct.pack(">I", 0x200)
                 + b"isomiso2mp41" + bytes(stsd_entry[4:8]))
 
-    mdat_size = sum(rl for _, rl in runs)
+    mdat_size = sum(rl for _, _, rl in runs)
     # 64-bit mdat if needed
     if mdat_size + 8 > 0xFFFFFFFF:
         mdat_header = struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", mdat_size + 16)
@@ -487,19 +553,144 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
 
     run_out_starts: list[int] = []
     out = len(header)
-    for _, rl in runs:
+    for _, _, rl in runs:
         run_out_starts.append(out)
         out += rl
 
     return RemuxIndex(
-        src_path=os.path.abspath(src_path),
-        src_size=st.st_size,
-        src_mtime=int(st.st_mtime),
+        src_path=first.src_path,
+        src_size=first.src_size,
+        src_mtime=first.src_mtime,
         header=header,
         runs=tuple(runs),
         run_out_starts=tuple(run_out_starts),
         total_size=out,
+        src_paths=tuple(sc.src_path for sc in scans),
+        duration=total_dur / timescale if timescale else 0.0,
     )
+
+
+def build_remux_index(src_path: str | Path) -> RemuxIndex:
+    """Build the :class:`RemuxIndex` for one recording's flat, video-only
+    remux (``hev1`` retagged to ``hvc1``, any other sample entry kept).
+
+    Raises on structural failure (caller treats the file as unplayable).
+    """
+    return _assemble([_scan_video(src_path)])
+
+
+# ---------------------------------------------------------------------------
+# Chained indexes: several consecutive recordings as one video
+# ---------------------------------------------------------------------------
+#
+# Recordings are one file per minute. Serving them one at a time made the
+# player stop at every boundary to open the next file, and a cold file's scan
+# alone takes ~2 s on the archive drive (USB behind Docker's virtiofs, where
+# every small read is slow) — at 8x a clip lasts 7.5 s. A chained index plays
+# ~10 minutes as one file, and the per-file scans run in parallel (cold: ~2 s
+# for 10 files vs ~19 s one after another) and are cached, so the next chain
+# can be scanned in the background before the player reaches it.
+
+MAX_CACHED_SCANS = 256
+
+_scans: OrderedDict[tuple[str, int, int], _VideoScan] = OrderedDict()
+_scan_inflight: dict[tuple[str, int, int], Future] = {}
+# Re-entrant: cancelling a queued future runs its done-callback (which takes
+# this lock) synchronously inside `_scan_future`, which already holds it.
+_scan_lock = threading.RLock()
+# Requests wait on the foreground pool; read-ahead uses its own small pool so
+# it never queues ahead of a viewer.
+_fg_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="remux-scan")
+_bg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="remux-readahead")
+
+
+def _scan_and_store(path: str, key: tuple[str, int, int]) -> _VideoScan:
+    scan = _scan_video(path)
+    with _scan_lock:
+        _scans[key] = scan
+        _scans.move_to_end(key)
+        while len(_scans) > MAX_CACHED_SCANS:
+            _scans.popitem(last=False)
+    return scan
+
+
+def _forget_inflight(key: tuple[str, int, int], fut: Future) -> None:
+    with _scan_lock:
+        if _scan_inflight.get(key) is fut:
+            del _scan_inflight[key]
+
+
+def _scan_future(path: str, background: bool) -> Future:
+    """The (cached, in-flight or newly started) scan of ``path``.
+
+    Keyed by size and mtime, so a file still being recorded is rescanned once
+    it has grown. A foreground request for a file whose read-ahead scan has
+    not started yet takes it over rather than waiting behind the queue.
+    """
+    path = os.path.abspath(path)
+    st = os.stat(path)
+    key = (path, st.st_size, int(st.st_mtime))
+    with _scan_lock:
+        hit = _scans.get(key)
+        if hit is not None:
+            _scans.move_to_end(key)
+            done: Future = Future()
+            done.set_result(hit)
+            return done
+        fut = _scan_inflight.get(key)
+        if fut is not None and not fut.done() and (
+            background or fut.running() or not fut.cancel()
+        ):
+            return fut
+        pool = _bg_pool if background else _fg_pool
+        fut = pool.submit(_scan_and_store, path, key)
+        _scan_inflight[key] = fut
+    # Outside the lock: an already-finished future runs the callback inline.
+    fut.add_done_callback(lambda f, k=key: _forget_inflight(k, f))
+    return fut
+
+
+def warm_scans(paths: list[str], background: bool = False) -> None:
+    """Start scanning ``paths`` without waiting (missing files are skipped)."""
+    for p in paths:
+        with contextlib.suppress(OSError):
+            _scan_future(p, background)
+
+
+def build_chain_index(paths: list[str], spans: list[float] | None = None) -> RemuxIndex:
+    """One :class:`RemuxIndex` playing ``paths`` back to back.
+
+    ``spans[i]`` is the wall-clock time from file i's start to file i+1's (see
+    ``_assemble``). The chain ends early at a file that can't be scanned or
+    whose video format differs from the first file's (a camera reconfigured
+    mid-run: one MP4 track can carry only one sample description).
+
+    Raises when the FIRST file can't be scanned.
+    """
+    futs: list[Future | None] = []
+    for p in paths:
+        try:
+            futs.append(_scan_future(p, background=False))
+        except OSError:
+            futs.append(None)
+    scans: list[_VideoScan] = []
+    for i, fut in enumerate(futs):
+        if fut is None:
+            if i == 0:
+                raise FileNotFoundError(paths[0])
+            break
+        try:
+            sc = fut.result()
+        except Exception:
+            if i == 0:
+                raise
+            break
+        if scans and (
+            sc.timescale != scans[0].timescale or sc.stsd_entry != scans[0].stsd_entry
+        ):
+            break
+        scans.append(sc)
+    return _assemble(scans, spans)
 
 
 def iter_index_range(
@@ -514,8 +705,9 @@ def iter_index_range(
     if start < 0 or end >= index.total_size or start > end:
         return
     hlen = len(index.header)
+    paths = index.src_paths or (index.src_path,)
     pos = start
-    src: BinaryIO | None = None
+    srcs: dict[int, BinaryIO] = {}
     try:
         while pos <= end:
             if pos < hlen:
@@ -523,13 +715,14 @@ def iter_index_range(
                 yield index.header[pos:upto + 1]
                 pos = upto + 1
                 continue
-            if src is None:
-                # opened lazily (header-only ranges never touch the source);
-                # closed in the finally below — the generator outlives a `with`
-                src = open(index.src_path, "rb")  # noqa: SIM115
             # locate the run containing `pos`
             i = bisect_right(index.run_out_starts, pos) - 1
-            src_off, run_len = index.runs[i]
+            no, src_off, run_len = index.runs[i]
+            src = srcs.get(no)
+            if src is None:
+                # opened lazily (header-only ranges never touch the sources);
+                # closed in the finally below — the generator outlives a `with`
+                src = srcs[no] = open(paths[no], "rb")  # noqa: SIM115
             within = pos - index.run_out_starts[i]
             need = min(run_len - within, end - pos + 1)
             src.seek(src_off + within)
@@ -538,14 +731,14 @@ def iter_index_range(
                 if not data:
                     recording_logger.warning(
                         "virtual remux: source truncated mid-read: %s",
-                        index.src_path,
+                        paths[no],
                     )
                     return
                 yield data
                 need -= len(data)
                 pos += len(data)
     finally:
-        if src is not None:
+        for src in srcs.values():
             src.close()
 
 
