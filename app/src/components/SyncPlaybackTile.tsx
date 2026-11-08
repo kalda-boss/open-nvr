@@ -56,62 +56,11 @@ type TileStatus = 'idle' | 'loading' | 'ok' | 'gap' | 'live' | 'error'
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
 
-/** Wall-clock bounds of a slot's media: startMs maps to video t=0. endMs is
- *  refined once the real duration is known — the session may resolve a
- *  physical file shorter than the listed segment. */
-interface MediaWindow {
-  startMs: number
-  endMs: number
-}
-
-/** One of a tile's two <video> elements and the session feeding it. */
-interface Slot {
-  hls: Hls | null
-  sessionId: string | null
-  token: number
-  window: MediaWindow | null
-  state: 'empty' | 'loading' | 'ready' | 'failed'
-  /** Wall-clock instant the session was anchored at. */
-  targetMs: number | null
-  /** Standby only: where the active media ended when this was prefetched. */
-  fromMs: number | null
-}
-
-const emptySlot = (): Slot => ({
-  hls: null,
-  sessionId: null,
-  token: 0,
-  window: null,
-  state: 'empty',
-  targetMs: null,
-  fromMs: null,
-})
-
-/**
- * Does the standby clip take over at master instant `m`? It covers from where
- * the active media ended (which also spans a small gap between files, and an
- * active clip that ran out early) to its own end. A standby still loading
- * covers the first few seconds past its anchor, so the swap waits for it
- * rather than starting a second load of the same clip.
- */
-function standbyCovers(sb: Slot, m: number, activeEndMs: number | null): boolean {
-  if (sb.state === 'ready' && sb.window) {
-    const from = Math.min(sb.window.startMs, sb.fromMs ?? Infinity, activeEndMs ?? Infinity)
-    return m >= from - 300 && m < sb.window.endMs - 300
-  }
-  if (sb.state === 'loading' && sb.targetMs != null) {
-    const from = Math.min(sb.targetMs, sb.fromMs ?? Infinity, activeEndMs ?? Infinity)
-    return m >= from - 300 && m < sb.targetMs + 10_000
-  }
-  return false
-}
-
 /**
  * One camera in the synchronized playback grid. The tile is a pure follower
  * of the shared master clock: whenever the master instant leaves the loaded
- * media window it swaps to the prefetched next clip, or opens a per-clip
- * session anchored AT that instant, and while inside the window it only
- * drift-corrects. Clip
+ * media window it opens a per-clip byte-range HLS session anchored AT that
+ * instant, and while inside the window it only drift-corrects. Clip
  * boundaries, gaps and the live edge all fall out of the same follow logic —
  * there is no per-tile transport state to get out of sync.
  */
@@ -130,28 +79,19 @@ export function SyncPlaybackTile({
   fisheye,
 }: SyncPlaybackTileProps) {
   const { t } = useTranslation()
-  // Two <video> elements per tile: the ACTIVE one plays, the STANDBY one
-  // preloads the clip that comes next. Recordings are one file per minute, so
-  // at 8x a clip lasts ~7.5 s; opening the next one only after the current one
-  // ran out (create session, fetch the header, buffer) stalled the tile at
-  // every boundary. With the next clip already parked at its first frame, the
-  // boundary is a swap.
-  const videoARef = useRef<HTMLVideoElement>(null)
-  const videoBRef = useRef<HTMLVideoElement>(null)
-  const videoRefs = useMemo(() => [videoARef, videoBRef] as const, [])
-  const slotsRef = useRef<[Slot, Slot]>([emptySlot(), emptySlot()])
-  const activeRef = useRef(0)
-  // Mirrors activeRef for rendering, and so the hooks below re-bind to the
-  // element that is showing.
-  const [activeIdx, setActiveIdx] = useState(0)
-  const videoRef = videoRefs[activeIdx]
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const hlsRef = useRef<Hls | null>(null)
   // The lazily-loaded hls.js module (see lib/loadHls); null until resolved.
   const hlsLibRef = useRef<typeof Hls | null>(null)
-  // Load tokens, shared by both slots: a slot's load only lands while the
-  // slot still holds the token it started with.
-  const tokenSeqRef = useRef(0)
-  // Target of the ACTIVE load in flight, so the follow loop doesn't spawn a
-  // new session on every master tick while one is being set up.
+  const sessionIdRef = useRef<string | null>(null)
+  // Only the latest load token wins; superseded async loads no-op.
+  const loadTokenRef = useRef(0)
+  // Wall-clock bounds of the media loaded into the <video>: startMs maps to
+  // video t=0. endMs is refined once the real media duration is known — the
+  // session may resolve a physical file shorter than the listed segment.
+  const windowRef = useRef<{ startMs: number; endMs: number } | null>(null)
+  // Target of the load currently in flight, so the follow loop doesn't spawn
+  // a new session on every master tick while one is being set up.
   const inFlightRef = useRef<{ targetMs: number } | null>(null)
   // Damper: after a failed load, don't retry until the master moves on. Without
   // this a segment whose metadata overstates its media would cause an endless
@@ -165,39 +105,20 @@ export function SyncPlaybackTile({
   const [status, setStatus] = useState<TileStatus>('idle')
   const [buffering, setBuffering] = useState(false)
 
-  /**
-   * Drop a slot's session and invalidate any load still in flight into it.
-   * `clearSrc` also releases the element's media (network + decoder); the
-   * active slot skips that when a new source is about to replace it anyway.
-   */
-  const teardownSlot = useCallback(
-    (i: number, clearSrc: boolean) => {
-      const s = slotsRef.current[i]
-      s.token = ++tokenSeqRef.current
-      if (s.hls) {
-        s.hls.destroy()
-        s.hls = null
-      }
-      const prev = s.sessionId
-      Object.assign(s, emptySlot(), { token: s.token })
-      if (prev) apiService.deleteHlsPlaybackSession(prev).catch(() => {})
-      const el = videoRefs[i].current
-      if (clearSrc && el) {
-        el.pause()
-        if (el.getAttribute('src')) {
-          el.removeAttribute('src')
-          el.load()
-        }
-      }
-    },
-    [videoRefs]
-  )
+  const teardownMedia = useCallback(() => {
+    if (hlsRef.current) {
+      hlsRef.current.destroy()
+      hlsRef.current = null
+    }
+    const prev = sessionIdRef.current
+    sessionIdRef.current = null
+    if (prev) apiService.deleteHlsPlaybackSession(prev).catch(() => {})
+  }, [])
 
-  /** Seek the active media to the CURRENT master instant and apply transport. */
+  /** Seek the loaded media to the CURRENT master instant and apply transport. */
   const settleAtMaster = useCallback(() => {
-    const i = activeRef.current
-    const el = videoRefs[i].current
-    const w = slotsRef.current[i].window
+    const el = videoRef.current
+    const w = windowRef.current
     if (!el || !w) return
     const off = (masterRef.current - w.startMs) / 1000
     if (off > 0.05) {
@@ -211,72 +132,24 @@ export function SyncPlaybackTile({
     el.playbackRate = rateRef.current
     el.muted = mutedRef.current
     if (playingRef.current) el.play().catch(() => {})
-  }, [videoRefs])
+  }, [])
 
   /**
-   * Open a per-clip HLS session anchored at `targetMs` inside `seg`, into slot
-   * `i`. Anchoring at the target (not the clip start) means the media always
-   * begins at the wanted instant and the backend resolves the physical file
-   * that actually contains it — merged-file boundaries need no special casing.
-   *
-   * `fromMs` marks a standby (prefetch) load: the instant the active media
-   * ends, from which this clip takes over. Whether the load lands as the
-   * active or the standby is decided when it is ready, so a standby promoted
-   * mid-load simply settles as the active one.
+   * Open a per-clip HLS session anchored at `targetMs` inside `seg`. Anchoring
+   * at the target (not the clip start) means the media always begins at the
+   * wanted instant and the backend resolves the physical file that actually
+   * contains it — merged-file boundaries need no special casing.
    */
-  const loadInto = useCallback(
-    async (i: number, seg: TimelineSegment, targetMs: number, fromMs: number | null) => {
-      const el = videoRefs[i].current
+  const loadAt = useCallback(
+    async (seg: TimelineSegment, targetMs: number) => {
+      const el = videoRef.current
       if (!el) return
-      teardownSlot(i, false)
-      const slot = slotsRef.current[i]
-      const token = ++tokenSeqRef.current
-      slot.token = token
+      const token = ++loadTokenRef.current
       const anchorMs = clamp(targetMs, seg.startMs, seg.endMs - 1500)
-      slot.state = 'loading'
-      slot.targetMs = anchorMs
-      slot.fromMs = fromMs
-      const current = () => slot.token === token
-      const isActive = () => activeRef.current === i
-      if (isActive()) {
-        inFlightRef.current = { targetMs: anchorMs }
-        setStatus('loading')
-      }
-
-      const fail = () => {
-        if (!current()) return
-        slot.state = 'failed'
-        if (isActive()) {
-          inFlightRef.current = null
-          failRef.current = { targetMs: anchorMs }
-          setBuffering(false)
-          setStatus('error')
-        }
-      }
-
-      const onReady = (win: MediaWindow) => {
-        if (!current()) return
-        slot.window = win
-        slot.state = 'ready'
-        if (isActive()) {
-          inFlightRef.current = null
-          failRef.current = null
-          setStatus('ok')
-          setBuffering(false)
-          settleAtMaster()
-          return
-        }
-        // Standby: park on the takeover instant, muted and paused, so the
-        // browser fetches and decodes that spot before the swap needs it.
-        el.muted = true
-        el.pause()
-        try {
-          const off = (anchorMs - win.startMs) / 1000
-          if (off > 0.05) el.currentTime = isFinite(el.duration) ? clamp(off, 0, Math.max(0, el.duration - 0.3)) : off
-        } catch {
-          /* not seekable yet; the swap seeks */
-        }
-      }
+      inFlightRef.current = { targetMs: anchorMs }
+      teardownMedia()
+      windowRef.current = null
+      setStatus('loading')
 
       let manifestUrl: string
       let browserMp4Url: string | null = null
@@ -293,22 +166,30 @@ export function SyncPlaybackTile({
           loadHls().catch(() => null),
         ])) as [any, typeof Hls | null]
         hlsLibRef.current = HlsLib
-        const sessionId: string | null = res.data?.session_id || null
-        if (!current()) {
-          // Superseded while the session was being created — don't leak it.
-          if (sessionId) apiService.deleteHlsPlaybackSession(sessionId).catch(() => {})
-          return
-        }
+        if (token !== loadTokenRef.current) return
         manifestUrl = res.data?.manifest_url
-        slot.sessionId = sessionId
+        sessionIdRef.current = res.data?.session_id || null
         if (res.data?.needs_remux && res.data?.browser_mp4_url) {
           browserMp4Url = res.data.browser_mp4_url
           fileOffsetSec = res.data.file_offset_seconds || 0
         }
         if (!manifestUrl && !browserMp4Url) throw new Error('No manifest returned')
       } catch {
-        fail()
+        if (token === loadTokenRef.current) {
+          inFlightRef.current = null
+          failRef.current = { targetMs: anchorMs }
+          setStatus('error')
+        }
         return
+      }
+
+      const onReady = () => {
+        if (token !== loadTokenRef.current) return
+        inFlightRef.current = null
+        failRef.current = null
+        setStatus('ok')
+        setBuffering(false)
+        settleAtMaster()
       }
 
       if (browserMp4Url) {
@@ -320,14 +201,28 @@ export function SyncPlaybackTile({
         el.src = browserMp4Url
         el.addEventListener(
           'loadedmetadata',
-          () =>
-            onReady({
+          () => {
+            if (token !== loadTokenRef.current) return
+            windowRef.current = {
               startMs: fileStartMs,
               endMs: fileStartMs + (isFinite(el.duration) ? el.duration * 1000 : seg.endMs - fileStartMs),
-            }),
+            }
+            onReady()
+          },
           { once: true }
         )
-        el.addEventListener('error', fail, { once: true })
+        el.addEventListener(
+          'error',
+          () => {
+            if (token === loadTokenRef.current) {
+              inFlightRef.current = null
+              failRef.current = { targetMs: anchorMs }
+              setBuffering(false)
+              setStatus('error')
+            }
+          },
+          { once: true }
+        )
       } else if (hlsLibRef.current?.isSupported()) {
         const HlsLib = hlsLibRef.current
         const hls = new HlsLib({
@@ -337,19 +232,23 @@ export function SyncPlaybackTile({
           maxBufferLength: 30,
           maxMaxBufferLength: 60,
         })
-        slot.hls = hls
+        hlsRef.current = hls
         hls.loadSource(manifestUrl)
         hls.attachMedia(el)
-        hls.on(HlsLib.Events.MANIFEST_PARSED, () => onReady({ startMs: anchorMs, endMs: seg.endMs }))
+        hls.on(HlsLib.Events.MANIFEST_PARSED, () => {
+          if (token !== loadTokenRef.current) return
+          windowRef.current = { startMs: anchorMs, endMs: seg.endMs }
+          onReady()
+        })
         // Refine the window end with the real media duration: the session only
         // covers the physical file containing its anchor, which can be shorter
         // than the listed (merged) segment. Crossing that boundary then simply
         // triggers the next anchored session.
         hls.on(HlsLib.Events.LEVEL_LOADED, (_evt, data) => {
-          if (!current()) return
+          if (token !== loadTokenRef.current) return
           const dur = data?.details?.totalduration
-          if (dur && slot.window) {
-            slot.window = { startMs: anchorMs, endMs: anchorMs + dur * 1000 }
+          if (dur && windowRef.current) {
+            windowRef.current = { startMs: anchorMs, endMs: anchorMs + dur * 1000 }
           }
         })
         hls.on(HlsLib.Events.ERROR, (_evt, data) => {
@@ -361,50 +260,22 @@ export function SyncPlaybackTile({
         el.src = manifestUrl
         el.addEventListener(
           'loadedmetadata',
-          () =>
-            onReady({
+          () => {
+            if (token !== loadTokenRef.current) return
+            windowRef.current = {
               startMs: anchorMs,
               endMs: anchorMs + (isFinite(el.duration) ? el.duration * 1000 : seg.endMs - anchorMs),
-            }),
+            }
+            onReady()
+          },
           { once: true }
         )
       } else {
-        fail()
-      }
-    },
-    [cameraId, videoRefs, teardownSlot, settleAtMaster]
-  )
-
-  /** Make slot `i` (the standby) the visible, playing one. */
-  const promote = useCallback(
-    (i: number) => {
-      const old = activeRef.current
-      activeRef.current = i
-      setActiveIdx(i)
-      setBuffering(false)
-      // Stop the old clip now, but keep its last frame until React has shown
-      // the new element — clearing the source first would flash black.
-      teardownSlot(old, false)
-      videoRefs[old].current?.pause()
-      const tok = slotsRef.current[old].token
-      requestAnimationFrame(() => {
-        const el = videoRefs[old].current
-        if (slotsRef.current[old].token !== tok || !el || !el.getAttribute('src')) return
-        el.removeAttribute('src')
-        el.load()
-      })
-      const s = slotsRef.current[i]
-      if (s.state === 'ready') {
         inFlightRef.current = null
-        failRef.current = null
-        setStatus('ok')
-        settleAtMaster()
-      } else {
-        inFlightRef.current = { targetMs: s.targetMs ?? masterRef.current }
-        setStatus('loading')
+        setStatus('error')
       }
     },
-    [videoRefs, teardownSlot, settleAtMaster]
+    [cameraId, teardownMedia, settleAtMaster]
   )
 
   // ---- The follow loop: reconcile the tile against the master clock --------
@@ -414,9 +285,7 @@ export function SyncPlaybackTile({
     rateRef.current = rate
     mutedRef.current = muted
 
-    const a = activeRef.current
-    const sbIdx = 1 - a
-    const el = videoRefs[a].current
+    const el = videoRef.current
     if (!el) return
     const m = masterMs
 
@@ -434,22 +303,15 @@ export function SyncPlaybackTile({
       return
     }
 
-    const w = slotsRef.current[a].window
+    const w = windowRef.current
     const inWindow = w && m >= w.startMs - 300 && m < w.endMs - 300
     if (!inWindow) {
-      // Crossed into the prefetched clip: swap instead of loading.
-      if (standbyCovers(slotsRef.current[sbIdx], m, w?.endMs ?? null)) {
-        promote(sbIdx)
-        return
-      }
       // A load for (roughly) this instant is already in flight — let it land;
       // it settles at the then-current master. A far-away target supersedes it.
       if (inFlightRef.current && Math.abs(inFlightRef.current.targetMs - m) < 10_000) return
       // Recent failure at this spot — wait for the master to move on.
       if (failRef.current && Math.abs(failRef.current.targetMs - m) < 5_000) return
-      // A fresh load somewhere else (a seek): the prefetched clip is moot.
-      if (slotsRef.current[sbIdx].state !== 'empty') teardownSlot(sbIdx, true)
-      loadInto(a, seg, m, null)
+      loadAt(seg, m)
       return
     }
 
@@ -474,58 +336,46 @@ export function SyncPlaybackTile({
     if (playing && el.paused && !el.ended) el.play().catch(() => {})
     else if (!playing && !el.paused) el.pause()
     setStatus('ok')
-
-    // Prefetch the next clip once the end is near — measured in footage
-    // time, so faster playback starts earlier (~6 s ahead at 1x, ~34 s of
-    // footage, i.e. ~4 s of real time, at 8x).
-    if (playing && slotsRef.current[sbIdx].state === 'empty' && w.endMs - m < 2000 + rate * 4000) {
-      const nextMs = w.endMs + 250
-      const nextSeg = segments.find((s) => nextMs >= s.startMs - 200 && nextMs < s.endMs)
-      if (nextSeg && !(liveEdgeMs != null && nextMs >= liveEdgeMs)) {
-        loadInto(sbIdx, nextSeg, nextMs, w.endMs)
-      }
-    }
-  }, [masterMs, playing, rate, muted, segments, liveEdgeMs, videoRefs, loadInto, promote, teardownSlot])
+  }, [masterMs, playing, rate, muted, segments, liveEdgeMs, loadAt])
 
   // ---- Video element events ------------------------------------------------
   useEffect(() => {
-    const offs = videoRefs.map((ref, i) => {
-      const el = ref.current
-      if (!el) return () => {}
-      // The standby buffers in the background; only the shown one drives UI.
-      const isActive = () => activeRef.current === i
-      const onWaiting = () => isActive() && setBuffering(true)
-      const onPlaying = () => isActive() && setBuffering(false)
-      const onCanPlay = () => isActive() && setBuffering(false)
-      const onEnded = () => {
-        // Media ran out before the listed segment end (durations can overstate,
-        // or the segment spans multiple physical files): shrink the window to
-        // what actually played so the follow loop moves on to the next clip.
-        if (!isActive()) return
-        const s = slotsRef.current[i]
-        if (s.window) s.window = { startMs: s.window.startMs, endMs: s.window.startMs + el.currentTime * 1000 }
-      }
-      el.addEventListener('waiting', onWaiting)
-      el.addEventListener('playing', onPlaying)
-      el.addEventListener('canplay', onCanPlay)
-      el.addEventListener('ended', onEnded)
-      return () => {
-        el.removeEventListener('waiting', onWaiting)
-        el.removeEventListener('playing', onPlaying)
-        el.removeEventListener('canplay', onCanPlay)
-        el.removeEventListener('ended', onEnded)
-      }
-    })
-    return () => offs.forEach((off) => off())
-  }, [videoRefs])
+    const el = videoRef.current
+    if (!el) return
+    const onWaiting = () => setBuffering(true)
+    const onPlaying = () => setBuffering(false)
+    const onCanPlay = () => setBuffering(false)
+    const onEnded = () => {
+      // Media ran out before the listed segment end (durations can overstate,
+      // or the segment spans multiple physical files): shrink the window to
+      // what actually played so the follow loop opens the next session.
+      const w = windowRef.current
+      if (w) windowRef.current = { startMs: w.startMs, endMs: w.startMs + el.currentTime * 1000 }
+    }
+    el.addEventListener('waiting', onWaiting)
+    el.addEventListener('playing', onPlaying)
+    el.addEventListener('canplay', onCanPlay)
+    el.addEventListener('ended', onEnded)
+    return () => {
+      el.removeEventListener('waiting', onWaiting)
+      el.removeEventListener('playing', onPlaying)
+      el.removeEventListener('canplay', onCanPlay)
+      el.removeEventListener('ended', onEnded)
+    }
+  }, [])
 
   // Cleanup on unmount (also covers deselecting the camera).
   useEffect(() => {
     return () => {
-      teardownSlot(0, true)
-      teardownSlot(1, true)
+      teardownMedia()
+      const el = videoRef.current
+      if (el) {
+        el.pause()
+        el.removeAttribute('src')
+        el.load()
+      }
     }
-  }, [teardownSlot])
+  }, [teardownMedia])
 
   // Coded size of the loaded clip vs. the aspect it should be shown at.
   const videoSize = useVideoSize(videoRef)
@@ -548,20 +398,12 @@ export function SyncPlaybackTile({
       {/* The clip carries the camera's coded size, which for an anamorphic
           stream is not the size to show it at — see lib/aspect.ts (#354). */}
       <AspectFrame aspect={dewarp.active ? null : videoAspect}>
-        {videoRefs.map((ref, i) => (
-          <video
-            key={i}
-            ref={ref}
-            className={
-              i === activeIdx
-                ? `block w-full h-full ${stretched ? 'object-fill' : 'object-contain'}`
-                : 'absolute inset-0 w-full h-full opacity-0 pointer-events-none'
-            }
-            playsInline
-            preload="auto"
-            crossOrigin="anonymous"
-          />
-        ))}
+        <video
+          ref={videoRef}
+          className={`block w-full h-full ${stretched ? 'object-fill' : 'object-contain'}`}
+          playsInline
+          crossOrigin="anonymous"
+        />
         {dewarp.active && dewarp.lens && dewarp.views && (
           <FisheyeView
             ref={fisheyeRef}
