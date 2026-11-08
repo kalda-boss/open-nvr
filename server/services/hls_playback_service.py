@@ -53,7 +53,6 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -146,9 +145,6 @@ class HlsPlaybackService:
     # grid: up to 4 tiles each holding one live session, plus churn headroom
     # while tiles cross clip boundaries (old sessions are deleted async).
     MAX_SESSIONS_PER_USER: int = 24
-    # Recordings chained into one remuxed video per session (1-min files ->
-    # ~10 min of footage between reloads).
-    REMUX_CHAIN_FILES: int = 10
     CLEANUP_INTERVAL: int = 300  # Cleanup expired sessions every 5 minutes
 
     # In-memory session storage (use Redis in production for scaling)
@@ -574,29 +570,6 @@ class HlsPlaybackService:
                 if row[1] > session_start:
                     break
                 holding = row
-            # Chain the back-to-back files that follow into one video (see
-            # hevc_remux_service.build_chain_index): the player then crosses
-            # ~10 minutes without reloading, instead of stopping every minute.
-            h = rows.index(holding)
-            chain = [holding]
-            for row in rows[h + 1:]:
-                _prev_path, prev_start, prev_dur = chain[-1]
-                if len(chain) >= cls.REMUX_CHAIN_FILES or prev_dur <= 0:
-                    break
-                prev_end = prev_start + timedelta(seconds=prev_dur)
-                if (row[1] - prev_end).total_seconds() > cls.CONTIGUITY_TOLERANCE_SECONDS:
-                    break
-                chain.append(row)
-            readahead = rows[h + len(chain):h + len(chain) + cls.REMUX_CHAIN_FILES]
-            try:
-                from services.hevc_remux_service import warm_scans
-
-                # Start the chain's scans now, in parallel with the per-file
-                # work below; then read ahead the chain the player opens next.
-                warm_scans([str(r[0]) for r in chain])
-                warm_scans([str(r[0]) for r in readahead], background=True)
-            except Exception:
-                pass
             rows = [holding]
             first_path = holding[0]
 
@@ -683,26 +656,17 @@ class HlsPlaybackService:
         # re-indexing mid-playback would shift every byte offset under the player.
         if needs_remux:
             try:
-                from services.hevc_remux_service import build_chain_index
+                from services.hevc_remux_service import build_remux_index
 
-                session.remux_index = build_chain_index(
-                    [str(r[0]) for r in chain],
-                    [(b[1] - a[1]).total_seconds() for a, b in pairwise(chain)],
-                )
-                # The remux plays the whole chain; files[] keeps only the
-                # first file (the legacy single-file mirrors above).
-                session.total_duration = session.remux_index.duration or timeline
+                session.remux_index = build_remux_index(first_path)
             except Exception as e:
                 session.remux_index = None
                 recording_logger.warning(
                     f"[HLS] Could not pre-index {first_path.name} for remux: {e}"
                 )
-        n_files = (
-            len(session.remux_index.src_paths) if session.remux_index else len(files)
-        )
         recording_logger.info(
-            f"[HLS] Indexed {n_files} file(s) for camera {camera_id}: "
-            f"{session.total_duration:.0f}s of media (codec={session.video_codec})"
+            f"[HLS] Indexed {len(files)} file(s) for camera {camera_id}: "
+            f"{timeline:.0f}s of media (codec={session.video_codec})"
         )
 
     @classmethod
