@@ -29,6 +29,13 @@ import { apiService } from '../../lib/apiService'
 import type Hls from 'hls.js'
 import { loadHls } from '../../lib/loadHls'
 import { resolveWhepSessionUrl } from '../../lib/streamUrl'
+import {
+  VoiceFocusChain,
+  primeVoiceFocusAudio,
+  readVoiceFocusPref,
+  voiceFocusSupported,
+  writeVoiceFocusPref,
+} from '../../lib/voiceFocus'
 import { displayAspect, isStretched, snapshotSize } from '../../lib/aspect'
 import type { AspectOverride } from '../../lib/aspect'
 import { useVideoSize } from '../../hooks/useVideoAspect'
@@ -196,6 +203,14 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     const onAuthExpiredRef = useRef(onAuthExpired)
     onAuthExpiredRef.current = onAuthExpired
     const [isReconnecting, setIsReconnecting] = useState(false)
+    // Voice focus (lib/voiceFocus.ts): this viewer's background-noise filter
+    // on the live WebRTC audio. While it routes the audio, the <video> is held
+    // muted and isMuted/volume below stop mirroring the element — they are the
+    // truth, and the filter chain's gain follows them.
+    const [voiceFocus, setVoiceFocus] = useState(readVoiceFocusPref)
+    const [voiceFocusFailed, setVoiceFocusFailed] = useState(false)
+    const [liveAudioTrack, setLiveAudioTrack] = useState<MediaStreamTrack | null>(null)
+    const voiceFocusChainRef = useRef<VoiceFocusChain | null>(null)
     // Coded frame size of the incoming stream, read from the video metadata.
     // null until known (or after the source is torn down).
     const videoSize = useVideoSize(videoRef)
@@ -209,6 +224,16 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     }, [])
 
     const isLive = mode === 'live'
+
+    // The live stream has a playable audio track and this browser can filter
+    // it. Cameras whose audio MediaMTX can't send over WebRTC (AAC) never fire
+    // an audio ontrack, so they get no toggle.
+    const voiceFocusAvailable =
+      isLive && streamType === 'webrtc' && liveAudioTrack !== null && voiceFocusSupported()
+    const audioRouted = voiceFocusAvailable && voiceFocus && !voiceFocusFailed
+    // Read by the element's volumechange listener, which is bound once.
+    const audioRoutedRef = useRef(audioRouted)
+    audioRoutedRef.current = audioRouted
 
     // The aspect the picture is DISPLAYED at, which is not always the aspect it
     // is CODED at: a Dahua-family "1080N" stream is 960x1080 for a 16:9 scene
@@ -336,6 +361,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         fetch(whepResourceRef.current, { method: 'DELETE' }).catch(() => {})
         whepResourceRef.current = null
       }
+      setLiveAudioTrack(null)
       // Clear video source completely and reset the element
       if (videoRef.current) {
         const el = videoRef.current
@@ -423,6 +449,20 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         pc.addTransceiver('audio', { direction: 'recvonly' })
 
         pc.ontrack = (ev) => {
+          if (ev.track.kind === 'audio') {
+            // An audio track arrives even when MediaMTX sends no audio (it
+            // drops AAC for WebRTC: Back Parking). A remote track stays
+            // `muted` until its first packet, so only a live one counts.
+            const track = ev.track
+            if (!track.muted) setLiveAudioTrack(track)
+            else {
+              track.addEventListener(
+                'unmute',
+                () => { if (pcRef.current === pc) setLiveAudioTrack(track) },
+                { once: true },
+              )
+            }
+          }
           const [stream] = ev.streams
           if (videoRef.current && stream) {
             // Clear any existing error when we get a valid stream
@@ -841,6 +881,9 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       const onWaiting = () => setIsLoading(true)
       const onCanPlay = () => setIsLoading(false)
       const onVolumeChange = () => {
+        // Voice focus holds the element muted on purpose; the player's own
+        // state is the truth then, so this would only flip it to "muted".
+        if (audioRoutedRef.current) return
         setIsMuted(el.muted)
         setVolume(el.volume)
       }
@@ -904,6 +947,41 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       }
     }, [])
 
+    // Hand the audio between the element and the filter. Routed: the element
+    // is muted and stays so. Released: it gets the player's mute state back
+    // (its volume was kept in step all along).
+    useEffect(() => {
+      const el = videoRef.current
+      if (!el) return
+      el.muted = audioRouted ? true : isMuted
+      // isMuted is deliberately not a dependency: outside voice focus the
+      // element owns it, and re-applying it on every change would fight that.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [audioRouted])
+
+    // Run the filter only while someone can hear it: routed AND unmuted. A
+    // wall of muted tiles costs nothing.
+    useEffect(() => {
+      if (!audioRouted || isMuted || !liveAudioTrack) return
+      const chain = new VoiceFocusChain(liveAudioTrack)
+      voiceFocusChainRef.current = chain
+      chain.setLevel(volume)
+      chain.start().catch((e) => {
+        console.warn('[VoiceFocus] could not start; playing the unfiltered audio', e)
+        if (voiceFocusChainRef.current === chain) setVoiceFocusFailed(true)
+      })
+      return () => {
+        chain.stop()
+        if (voiceFocusChainRef.current === chain) voiceFocusChainRef.current = null
+      }
+      // volume is applied by the effect below, without rebuilding the chain.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [audioRouted, isMuted, liveAudioTrack])
+
+    useEffect(() => {
+      voiceFocusChainRef.current?.setLevel(volume)
+    }, [volume])
+
     // Fullscreen change listener
     useEffect(() => {
       const onFullscreenChange = () => {
@@ -941,10 +1019,22 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     // Control handlers
     const handlePlay = () => videoRef.current?.play().catch(() => {})
     const handlePause = () => videoRef.current?.pause()
+    // While voice focus routes the audio, these drive React state (and so the
+    // filter's gain) instead of the element, which stays muted.
     const handleMute = () => {
-      if (videoRef.current) videoRef.current.muted = true
+      if (audioRoutedRef.current) setIsMuted(true)
+      else if (videoRef.current) videoRef.current.muted = true
     }
     const handleUnmute = () => {
+      if (audioRoutedRef.current) {
+        primeVoiceFocusAudio() // inside the click: iOS needs the gesture
+        setIsMuted(false)
+        if (volume === 0) {
+          if (videoRef.current) videoRef.current.volume = 0.5
+          setVolume(0.5)
+        }
+        return
+      }
       if (videoRef.current) {
         videoRef.current.muted = false
         if (volume === 0) {
@@ -954,10 +1044,25 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       }
     }
     const handleVolumeChange = (vol: number) => {
+      if (audioRoutedRef.current) {
+        if (vol > 0) primeVoiceFocusAudio()
+        if (videoRef.current) videoRef.current.volume = vol
+        setVolume(vol)
+        setIsMuted(vol === 0)
+        return
+      }
       if (videoRef.current) {
         videoRef.current.volume = vol
         videoRef.current.muted = vol === 0
       }
+    }
+    const handleVoiceFocusToggle = () => {
+      // A failed start reads as "off", so the next click retries it.
+      const next = !(voiceFocus && !voiceFocusFailed)
+      if (next) primeVoiceFocusAudio()
+      writeVoiceFocusPref(next)
+      setVoiceFocusFailed(false)
+      setVoiceFocus(next)
     }
     const handleSeek = (time: number) => {
       if (videoRef.current) videoRef.current.currentTime = time
@@ -1119,7 +1224,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
           ref={videoRef}
           className={`block w-full h-full ${stretched ? 'object-fill' : 'object-contain'}`}
           playsInline
-          muted={isMuted}
+          muted={audioRouted || isMuted}
           autoPlay={autoPlay}
           crossOrigin="anonymous"
           preload={mode === 'playback' ? 'metadata' : 'auto'}
@@ -1291,6 +1396,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             onTogglePtz={onTogglePtz}
             ptzActive={ptzActive}
             talkCameraId={mode === 'live' ? cameraId : null}
+            voiceFocus={voiceFocusAvailable ? { on: voiceFocus && !voiceFocusFailed, onToggle: handleVoiceFocusToggle } : null}
             dewarpModes={dewarp.modes}
             dewarpMode={dewarp.mode}
             onDewarpModeChange={dewarp.setMode}
