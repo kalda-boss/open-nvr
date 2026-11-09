@@ -46,21 +46,27 @@ Security:
 """
 
 import asyncio
-import os
 import struct
+import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 
 from core.config import settings
 from core.logging_config import recording_logger
 from services.mediamtx_client import playback_auth
+from services.recording_source import (
+    file_size as _file_size,
+    open_recording,
+    stat_recording,
+)
 
 
 @dataclass
@@ -145,6 +151,15 @@ class HlsPlaybackService:
     # grid: up to 4 tiles each holding one live session, plus churn headroom
     # while tiles cross clip boundaries (old sessions are deleted async).
     MAX_SESSIONS_PER_USER: int = 24
+    # Remuxed (H.265) sessions serve one 1-minute file, so the player opens
+    # the next file every minute of footage (every 7.5 s at 8x). A cold file
+    # takes ~2 s to index on the archive drive (USB behind Docker's virtiofs);
+    # reading the next few ahead makes that open nearly instant.
+    REMUX_READAHEAD_FILES: int = 3
+    _READAHEAD_MAX_PENDING: int = 24
+    _readahead_pool: ThreadPoolExecutor | None = None
+    _readahead_pending: ClassVar[set[str]] = set()
+    _readahead_lock = threading.Lock()
     CLEANUP_INTERVAL: int = 300  # Cleanup expired sessions every 5 minutes
 
     # In-memory session storage (use Redis in production for scaling)
@@ -423,7 +438,7 @@ class HlsPlaybackService:
         from models import Recording
         from services.storage_service import (
             get_effective_recordings_base_path,
-            resolve_under_root,
+            resolve_files_under_root,
         )
 
         if start_time.tzinfo is None:
@@ -454,7 +469,7 @@ class HlsPlaybackService:
             return [(path, file_start, 0.0)]
 
         root = Path(get_effective_recordings_base_path(db))
-        out: list[tuple[Path, datetime, float]] = []
+        wanted: list[tuple[str, datetime, float]] = []
         for rel, row_start, row_dur in rows:
             if row_start.tzinfo is None:
                 row_start = row_start.replace(tzinfo=UTC)
@@ -463,13 +478,14 @@ class HlsPlaybackService:
             # Keep only files overlapping the window (allowing 1s clock skew).
             if row_end <= start_time - timedelta(seconds=1) or row_start >= end_time:
                 continue
-            try:
-                resolved = resolve_under_root(root, rel)
-            except Exception:
-                continue
-            if resolved.is_file():
-                out.append((resolved, row_start, dur))
-        return out
+            wanted.append((rel, row_start, dur))
+        # Path-checked in one pass per directory (V-005), not per file.
+        resolved = resolve_files_under_root(root, [rel for rel, _s, _d in wanted])
+        return [
+            (resolved[rel], row_start, dur)
+            for rel, row_start, dur in wanted
+            if rel in resolved
+        ]
 
     @classmethod
     def _stored_codec(
@@ -570,6 +586,23 @@ class HlsPlaybackService:
                 if row[1] > session_start:
                     break
                 holding = row
+            h = rows.index(holding)
+            # A start in the holding file's last second is the player crossing
+            # into the next file: it asks just before the current media ends.
+            # Index start times are whole seconds (the file really begins a
+            # fraction later), so "the latest file started by then" was still
+            # the old file, and the player had to ask a second time.
+            if h + 1 < len(rows) and holding[2] > 0:
+                nxt = rows[h + 1]
+                holding_end = holding[1] + timedelta(seconds=holding[2])
+                if (
+                    (holding_end - session_start).total_seconds() < 1.0
+                    and (nxt[1] - holding_end).total_seconds()
+                    <= cls.CONTIGUITY_TOLERANCE_SECONDS
+                ):
+                    h += 1
+                    holding = nxt
+            cls._read_ahead(rows[h + 1:h + 1 + cls.REMUX_READAHEAD_FILES])
             rows = [holding]
             first_path = holding[0]
 
@@ -656,9 +689,9 @@ class HlsPlaybackService:
         # re-indexing mid-playback would shift every byte offset under the player.
         if needs_remux:
             try:
-                from services.hevc_remux_service import build_remux_index
+                from services.hevc_remux_service import remux_index_cached
 
-                session.remux_index = build_remux_index(first_path)
+                session.remux_index = remux_index_cached(first_path)
             except Exception as e:
                 session.remux_index = None
                 recording_logger.warning(
@@ -680,20 +713,59 @@ class HlsPlaybackService:
         (its size/mtime moved) and is re-scanned.
         """
         try:
-            st = path.stat()
+            st = stat_recording(path)
         except OSError:
             return None
         key = (str(path), st.st_size, int(st.st_mtime))
-        cached = cls._scan_cache.get(key)
-        if cached is not None:
-            cls._scan_cache.move_to_end(key)
-            return cached
+        # Locked: sessions are built in worker threads, and the read-ahead
+        # fills this cache from its own threads.
+        with cls._readahead_lock:
+            cached = cls._scan_cache.get(key)
+            if cached is not None:
+                cls._scan_cache.move_to_end(key)
+                return cached
         scan = cls._scan_fmp4(path)
         if scan is not None:
-            cls._scan_cache[key] = scan
-            if len(cls._scan_cache) > cls._SCAN_CACHE_MAX:
-                cls._scan_cache.popitem(last=False)
+            with cls._readahead_lock:
+                cls._scan_cache[key] = scan
+                if len(cls._scan_cache) > cls._SCAN_CACHE_MAX:
+                    cls._scan_cache.popitem(last=False)
         return scan
+
+    @classmethod
+    def _read_ahead(cls, rows: list[tuple[Path, datetime, float]]) -> None:
+        """Index ``rows``' files in the background, so the sessions the player
+        opens next find them cached. Two worker threads, one pending entry per
+        file, and a cap on pending work: under load it reads ahead less
+        rather than queueing reads the player won't wait for."""
+        with cls._readahead_lock:
+            if cls._readahead_pool is None:
+                cls._readahead_pool = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="hls-readahead"
+                )
+            for path, _start, _dur in rows:
+                key = str(path)
+                if (
+                    key in cls._readahead_pending
+                    or len(cls._readahead_pending) >= cls._READAHEAD_MAX_PENDING
+                ):
+                    continue
+                cls._readahead_pending.add(key)
+                cls._readahead_pool.submit(cls._warm_file, path)
+
+    @classmethod
+    def _warm_file(cls, path: Path) -> None:
+        try:
+            if cls._scan_fmp4_cached(path) is None:
+                return
+            from services.hevc_remux_service import remux_index_cached
+
+            remux_index_cached(path)
+        except Exception as e:
+            recording_logger.debug(f"[HLS] read-ahead of {path.name} failed: {e}")
+        finally:
+            with cls._readahead_lock:
+                cls._readahead_pending.discard(str(path))
 
     @classmethod
     def _resolve_recording_file(
@@ -783,8 +855,12 @@ class HlsPlaybackService:
         init_length = 0
         frag_start: int | None = None
 
-        with open(path, "rb") as f:
-            total = os.fstat(f.fileno()).st_size
+        # The first walk of a file: through the host reader, large sequential
+        # reads beat one disk seek per fragment on a busy spinning drive, and
+        # they leave the file in the host's page cache for the remux index
+        # walk and the streaming that follow.
+        with open_recording(path, block=1 << 20) as f:
+            total = _file_size(f)
             pos = 0
             while pos + 8 <= total:
                 f.seek(pos)

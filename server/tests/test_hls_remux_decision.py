@@ -92,3 +92,83 @@ def test_a_remux_session_at_a_file_boundary_gets_the_next_file(tmp_path, monkeyp
     assert [f.path for f in session.files] == [str(second)]
     assert session.file_offset_seconds == 0.0
     assert session.remux_index.src_path == str(second.resolve())
+
+
+def _rows(tmp_path, n, durations=60.15):
+    start = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    rows = []
+    for i in range(n):
+        p = tmp_path / f"{i}.mp4"
+        _clip(p, b"hev1", b"ipcm")
+        rows.append((p, start + timedelta(seconds=60 * i), durations))
+    return start, rows
+
+
+def _patch_rows(monkeypatch, rows, read_ahead=None):
+    monkeypatch.setattr(
+        HlsPlaybackService, "_resolve_recording_rows", classmethod(lambda cls, *a: rows)
+    )
+    monkeypatch.setattr(HlsPlaybackService, "_stored_codec", classmethod(lambda cls, *a: None))
+    monkeypatch.setattr(
+        HlsPlaybackService, "_read_ahead",
+        classmethod(lambda cls, r: read_ahead.append(r) if read_ahead is not None else None),
+    )
+
+
+def test_a_start_in_the_last_second_of_a_file_gets_the_next_file(tmp_path, monkeypatch):
+    """The player asks for the next file 0.3 s before the current media ends.
+    Index starts are whole seconds, so the next file's row starts AFTER that
+    instant; the session must still serve the next file, or the player gets
+    the old one back and has to ask twice at every boundary."""
+    start, rows = _rows(tmp_path, 2)
+    _patch_rows(monkeypatch, rows)
+    session = _session(start + timedelta(seconds=59.85))
+    HlsPlaybackService._attach_byte_index(session, 7, object(), 0.0)
+    assert [f.path for f in session.files] == [str(rows[1][0])]
+    assert session.file_offset_seconds == 0.0
+
+
+def test_a_start_mid_file_keeps_that_file(tmp_path, monkeypatch):
+    start, rows = _rows(tmp_path, 2)
+    _patch_rows(monkeypatch, rows)
+    session = _session(start + timedelta(seconds=30))
+    HlsPlaybackService._attach_byte_index(session, 7, object(), 0.0)
+    assert [f.path for f in session.files] == [str(rows[0][0])]
+    assert session.file_offset_seconds == 30.0
+
+
+def test_the_last_second_before_a_gap_keeps_the_file(tmp_path, monkeypatch):
+    start, rows = _rows(tmp_path, 2)
+    rows[1] = (rows[1][0], start + timedelta(minutes=5), 60.0)  # recording gap
+    _patch_rows(monkeypatch, rows)
+    session = _session(start + timedelta(seconds=59.85))
+    HlsPlaybackService._attach_byte_index(session, 7, object(), 0.0)
+    assert [f.path for f in session.files] == [str(rows[0][0])]
+
+
+def test_a_remux_session_reads_ahead_the_next_files(tmp_path, monkeypatch):
+    start, rows = _rows(tmp_path, 6)
+    seen: list = []
+    _patch_rows(monkeypatch, rows, seen)
+    session = _session(start + timedelta(seconds=10))
+    HlsPlaybackService._attach_byte_index(session, 7, object(), 0.0)
+    assert seen == [rows[1:4]]
+
+
+def test_read_ahead_leaves_the_next_session_nothing_to_index(tmp_path, monkeypatch):
+    from services import hevc_remux_service as hrs
+
+    start, rows = _rows(tmp_path, 2)
+    HlsPlaybackService._warm_file(rows[1][0])
+    builds: list = []
+    real = hrs.build_remux_index
+    monkeypatch.setattr(hrs, "build_remux_index", lambda p: builds.append(p) or real(p))
+    monkeypatch.setattr(
+        HlsPlaybackService, "_scan_fmp4", classmethod(lambda cls, p: builds.append(p))
+    )
+    _patch_rows(monkeypatch, rows)
+    session = _session(start + timedelta(seconds=70))
+    HlsPlaybackService._attach_byte_index(session, 7, object(), 0.0)
+    assert session.remux_index is not None
+    assert builds == []
+    assert HlsPlaybackService._readahead_pending == set()

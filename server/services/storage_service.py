@@ -24,6 +24,9 @@ MediaMTX handles recording via webhooks - this service only provides file listin
 import json
 import logging
 import os
+import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -207,6 +210,16 @@ def resolve_under_root(root: Path, rel: str | Path) -> Path:
     Returns the canonical absolute path on success; raises
     :class:`RecordingPathError` on any rejection.
     """
+    rel_path = _check_relative(rel)
+    base_resolved = _resolve_strict(Path(root).expanduser())
+    candidate = _resolve_strict(base_resolved / rel_path)
+    _require_under(base_resolved, candidate)
+    return candidate
+
+
+def _check_relative(rel: str | Path) -> Path:
+    """The lexical half of :func:`resolve_under_root`: ``rel`` as a Path, or
+    :class:`RecordingPathError` when it is empty, absolute or uses ``..``."""
     if rel is None or (isinstance(rel, str) and not rel.strip()):
         raise RecordingPathError("recording path is empty")
     rel_path = Path(rel)
@@ -231,10 +244,10 @@ def resolve_under_root(root: Path, rel: str | Path) -> Path:
                 f"recording path contains a forbidden component "
                 f"({part!r}) in {str(rel_path)!r}"
             )
+    return rel_path
 
-    base_resolved = _resolve_strict(Path(root).expanduser())
-    candidate = _resolve_strict(base_resolved / rel_path)
 
+def _require_under(base_resolved: Path, candidate: Path) -> None:
     try:
         # Python 3.9+: Path.is_relative_to. We require the candidate to be at
         # or below the base after symlink resolution.
@@ -251,7 +264,85 @@ def resolve_under_root(root: Path, rel: str | Path) -> Path:
                 f"recording path resolves outside the configured base: "
                 f"base={base_resolved} candidate={candidate}"
             ) from exc
-    return candidate
+
+
+#: Directory listings reused by :func:`resolve_files_under_root`, keyed by
+#: (root, directory): (listed_at, resolved_dir, {name: (is_file, is_symlink)}).
+_DIR_LISTING_TTL_SECONDS = 30.0
+_DIR_LISTING_MAX = 256
+_dir_listings: OrderedDict[
+    tuple[str, str], tuple[float, Path, dict[str, tuple[bool, bool]]]
+] = OrderedDict()
+_dir_listings_lock = threading.Lock()
+
+
+def _list_dir(root: Path, parent: str, fresh: bool):
+    key = (str(root), parent)
+    now = time.monotonic()
+    if not fresh:
+        with _dir_listings_lock:
+            hit = _dir_listings.get(key)
+            if hit is not None and now - hit[0] < _DIR_LISTING_TTL_SECONDS:
+                return hit[1], hit[2]
+    if parent == ".":
+        resolved = _resolve_strict(Path(root).expanduser())
+    else:
+        resolved = resolve_under_root(root, parent)
+    with os.scandir(resolved) as it:
+        kinds = {
+            e.name: (e.is_file(follow_symlinks=False), e.is_symlink()) for e in it
+        }
+    with _dir_listings_lock:
+        _dir_listings[key] = (now, resolved, kinds)
+        _dir_listings.move_to_end(key)
+        while len(_dir_listings) > _DIR_LISTING_MAX:
+            _dir_listings.popitem(last=False)
+    return resolved, kinds
+
+
+def resolve_files_under_root(root: Path, rels: list[str]) -> dict[str, Path]:
+    """:func:`resolve_under_root` for many files, keeping only those that exist
+    as regular files. Returns ``{rel: canonical path}``; rejected or missing
+    paths are left out.
+
+    Same guarantees, far fewer filesystem calls: each directory is resolved
+    (symlinks and containment checked) and listed once, then a file is
+    accepted when the listing shows a regular, non-symlink entry, which is
+    therefore inside that directory. On Docker Desktop's file sharing each
+    per-file check costs ~12 ms, so a 1-hour playback window (60 clips) took
+    ~6 s; a listing costs one call and is reused for
+    ``_DIR_LISTING_TTL_SECONDS``. A name missing from a reused listing (a clip
+    that just landed) triggers one fresh listing. Symlinked entries take the
+    per-file check.
+    """
+    by_dir: dict[str, list[tuple[str, str]]] = {}
+    for rel in rels:
+        try:
+            rel_path = _check_relative(rel)
+        except RecordingPathError:
+            continue
+        by_dir.setdefault(str(rel_path.parent), []).append((rel, rel_path.name))
+
+    out: dict[str, Path] = {}
+    for parent, members in by_dir.items():
+        try:
+            resolved, kinds = _list_dir(root, parent, fresh=False)
+            if any(name not in kinds for _rel, name in members):
+                resolved, kinds = _list_dir(root, parent, fresh=True)
+        except (OSError, RecordingPathError):
+            continue
+        for rel, name in members:
+            is_file, is_link = kinds.get(name, (False, False))
+            if is_file:
+                out[rel] = resolved / name
+            elif is_link:
+                try:
+                    target = resolve_under_root(root, rel)
+                    if target.is_file():
+                        out[rel] = target
+                except (OSError, RecordingPathError):
+                    pass
+    return out
 
 
 def safe_recording_path(rel: str | Path, db: Session | None = None) -> Path:

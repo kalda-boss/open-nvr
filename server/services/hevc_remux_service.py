@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import os
 import struct
+import threading
 from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Iterator
@@ -56,6 +57,11 @@ from pathlib import Path
 from typing import BinaryIO
 
 from core.logging_config import recording_logger
+from services.recording_source import (
+    file_size as _file_size,
+    open_recording,
+    stat_recording,
+)
 
 # ---------------------------------------------------------------------------
 # ISO-BMFF helpers (seek-based; never loads mdat payloads into memory)
@@ -80,7 +86,7 @@ def _read_box_header(f: BinaryIO, pos: int) -> tuple[bytes, int, int] | None:
         size = struct.unpack(">Q", ext)[0]
         hdr = 16
     elif size == 0:
-        size = os.fstat(f.fileno()).st_size - pos
+        size = _file_size(f) - pos
     if size < hdr:
         return None
     return typ, hdr, size
@@ -95,7 +101,7 @@ def _iter_top_level(f: BinaryIO):
     of the file and truncate playback, so the scan stops at the last COMPLETE
     box — which is exactly the "everything finished so far" boundary.
     """
-    size_total = os.fstat(f.fileno()).st_size
+    size_total = _file_size(f)
     pos = 0
     while pos + 8 <= size_total:
         info = _read_box_header(f, pos)
@@ -162,7 +168,7 @@ def _probe_codec(path: str | Path, handler: bytes) -> str | None:
     """Sample-entry fourcc (lowercased) of the first ``handler`` track, or None.
     Cheap: reads only the moov box."""
     try:
-        with open(path, "rb") as f:
+        with open_recording(path, block=16 * 1024) as f:
             for typ, pos, hdr, size in _iter_top_level(f):
                 if typ != b"moov":
                     continue
@@ -275,8 +281,8 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
     Raises on structural failure (caller treats the file as unplayable).
     """
     src_path = str(src_path)
-    st = os.stat(src_path)
-    with open(src_path, "rb") as f:
+    st = stat_recording(src_path)
+    with open_recording(src_path, block=16 * 1024) as f:
         # -- locate moov, extract video track metadata + retagged sample entry --
         moov = None
         for typ, pos, hdr, size in _iter_top_level(f):
@@ -329,7 +335,7 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
         sample_durs: list[int] = []
         sync_samples: list[int] = []  # 1-based indices
         runs: list[tuple[int, int]] = []  # (file_offset, run_length) video-only
-        file_size = os.fstat(f.fileno()).st_size
+        file_size = _file_size(f)
         for typ, pos, hdr, size in _iter_top_level(f):
             if typ != b"moof":
                 continue
@@ -523,15 +529,17 @@ def iter_index_range(
                 yield index.header[pos:upto + 1]
                 pos = upto + 1
                 continue
-            if src is None:
-                # opened lazily (header-only ranges never touch the source);
-                # closed in the finally below — the generator outlives a `with`
-                src = open(index.src_path, "rb")  # noqa: SIM115
             # locate the run containing `pos`
             i = bisect_right(index.run_out_starts, pos) - 1
             src_off, run_len = index.runs[i]
             within = pos - index.run_out_starts[i]
             need = min(run_len - within, end - pos + 1)
+            if src is None:
+                # opened lazily (header-only ranges never touch the source);
+                # closed in the finally below — the generator outlives a `with`
+                src = open_recording(
+                    index.src_path, block=1 << 20, offset=src_off + within
+                )
             src.seek(src_off + within)
             while need > 0:
                 data = src.read(min(chunk, need))
@@ -569,11 +577,38 @@ def remux_to_browser_mp4(src_path: str | Path, dst_path: str | Path) -> None:
 
 MAX_CACHED_INDEXES = 8
 
+# Thread-safe LRU for indexes built while creating a playback session (that
+# runs in a worker thread) and by the read-ahead that warms the files a viewer
+# reaches next. Sized for a few tiles each holding a file plus read-ahead.
+MAX_SESSION_INDEXES = 48
+_session_indexes: OrderedDict[str, RemuxIndex] = OrderedDict()
+_session_indexes_lock = threading.Lock()
+
+
+def remux_index_cached(src_path: str | Path) -> RemuxIndex:
+    """:func:`build_remux_index`, reusing a cached index while the file is
+    unchanged (same size and mtime). Blocking — call from a worker thread.
+    Raises like :func:`build_remux_index`."""
+    src_path = os.path.abspath(src_path)
+    st = stat_recording(src_path)
+    with _session_indexes_lock:
+        idx = _session_indexes.get(src_path)
+        if _index_current(idx, st):
+            _session_indexes.move_to_end(src_path)
+            return idx
+    idx = build_remux_index(src_path)
+    with _session_indexes_lock:
+        _session_indexes[src_path] = idx
+        _session_indexes.move_to_end(src_path)
+        while len(_session_indexes) > MAX_SESSION_INDEXES:
+            _session_indexes.popitem(last=False)
+    return idx
+
 _indexes: OrderedDict[str, RemuxIndex] = OrderedDict()
 _locks: dict[str, asyncio.Lock] = {}
 
 
-def _index_current(idx: RemuxIndex | None, st: os.stat_result) -> bool:
+def _index_current(idx: RemuxIndex | None, st) -> bool:
     return (
         idx is not None
         and idx.src_size == st.st_size
@@ -592,7 +627,7 @@ async def get_remux_index(src_path: str) -> RemuxIndex | None:
     """
     src_path = os.path.abspath(src_path)
     try:
-        st = os.stat(src_path)
+        st = stat_recording(src_path)
     except FileNotFoundError:
         _indexes.pop(src_path, None)
         return None
@@ -608,7 +643,7 @@ async def get_remux_index(src_path: str) -> RemuxIndex | None:
     lock = _locks.setdefault(src_path, asyncio.Lock())
     async with lock:
         try:
-            st = os.stat(src_path)
+            st = stat_recording(src_path)
         except FileNotFoundError:
             _indexes.pop(src_path, None)
             return None
