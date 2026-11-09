@@ -41,6 +41,8 @@ export function Tile({
   isDragging = false,
   canManage = false,
   showDetections = false,
+  muted = true,
+  onMutedChange,
 }: { 
   index: number
   availableCameras: LiveCamera[]
@@ -50,6 +52,9 @@ export function Tile({
   isDragging?: boolean
   showDetections?: boolean
   canManage?: boolean
+  /** Sound off (the default, and always on the wall); see VideoPlayer. */
+  muted?: boolean
+  onMutedChange?: (muted: boolean) => void
 }) {
   const { t } = useTranslation()
   const [cameraId, setCameraId] = useState<number | null>(null)
@@ -181,7 +186,8 @@ export function Tile({
             title={displayName}
             preferredStreamType="webrtc"
             autoPlay
-            muted
+            muted={muted}
+            onMutedChange={onMutedChange}
             onSnapshot={handleSnapshot}
             displayAspectOverride={assignedCamera?.display_aspect_ratio}
             fisheye={assignedCamera?.fisheye}

@@ -15,7 +15,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { clsx } from 'clsx'
-import { Maximize, Maximize2, Minimize, ScanEye, Tv } from 'lucide-react'
+import { Maximize, Maximize2, Minimize, ScanEye, Tv, Volume2, VolumeX } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 import { useCameras, type CameraItem } from '../../lib/queries'
 import { useMediaQuery } from '../../hooks/useMediaQuery'
@@ -235,6 +235,21 @@ export function PhoneLiveView() {
   const tileOf = (id: number) => (view.mode === 'quad' ? view.quad.indexOf(id) : -1)
   const target = view.mode === 'quad' ? view.quad[view.active] : view.single
 
+  // Sound: off on every visit, and only ever the selected camera (Single's,
+  // or the outlined quad tile's). The player reports back when the browser
+  // refuses sound (iOS won't autoplay audio outside a tap), so the button
+  // never claims sound that isn't playing; one more tap turns it on.
+  // (A camera without a WebRTC-playable track, AAC or none, still connects
+  // with audio: MediaMTX fills in a silent G.711 track, so the page can't
+  // tell it apart and the button stays live.)
+  const [soundOn, setSoundOn] = useState(false)
+  const audioCamRef = useRef(target)
+  audioCamRef.current = target
+  const tileAudio = (id: number) => ({
+    muted: !(soundOn && id === target),
+    onMutedChange: (m: boolean) => { if (id === audioCamRef.current) setSoundOn(!m) },
+  })
+
   return (
     // -m-4 cancels <main>'s padding; dvh, not vh, so iOS's collapsing
     // toolbars don't push the bottom of the list off screen.
@@ -302,7 +317,7 @@ export function PhoneLiveView() {
               </div>
             ) : view.mode === 'single' ? (
               view.single != null && (
-                <Tile key={view.single} index={0} availableCameras={liveCams} assignedCameraId={view.single} showDetections={showDetections} />
+                <Tile key={view.single} index={0} availableCameras={liveCams} assignedCameraId={view.single} showDetections={showDetections} {...tileAudio(view.single)} />
               )
             ) : (
               <div className="absolute inset-0 grid grid-cols-2 grid-rows-2 gap-px bg-[#1a1f29]">
@@ -318,7 +333,7 @@ export function PhoneLiveView() {
                     className="relative min-w-0 min-h-0"
                   >
                     {id ? (
-                      <Tile index={i} availableCameras={liveCams} assignedCameraId={id} showDetections={showDetections} />
+                      <Tile index={i} availableCameras={liveCams} assignedCameraId={id} showDetections={showDetections} {...tileAudio(id)} />
                     ) : (
                       <div className="absolute inset-0 flex items-center justify-center p-2 text-center text-white/45 text-[10px] font-mono uppercase tracking-[0.15em]" style={{ background: NO_PICTURE_BG }}>
                         {view.active === i ? t('live.pickFromList') : t('live.tileN', { n: i + 1 })}
@@ -360,6 +375,21 @@ export function PhoneLiveView() {
                 ? t('live.pickForTile', { n: view.active + 1 })
                 : <span className="font-semibold uppercase tracking-[0.12em]">{t('live.cameraList')} <span className="font-mono tabular-nums font-normal">· {cameras.length}</span></span>}
             </p>
+            {target != null && target !== 0 && (
+              <button
+                type="button"
+                onClick={() => setSoundOn((on) => !on)}
+                aria-pressed={soundOn}
+                aria-label={soundOn ? t('live.soundOff') : t('live.soundOn')}
+                title={soundOn ? t('live.soundOff') : t('live.soundOn')}
+                className={clsx(
+                  'w-11 h-11 shrink-0 flex items-center justify-center border-l border-[var(--border)]',
+                  soundOn ? 'bg-[var(--accent)] text-white' : 'text-[var(--text-dim)] active:bg-[var(--panel)]',
+                )}
+              >
+                {soundOn ? <Volume2 size={18} /> : <VolumeX size={18} />}
+              </button>
+            )}
             {view.mode === 'quad' && view.quad[view.active] !== 0 && (
               <button
                 type="button"
