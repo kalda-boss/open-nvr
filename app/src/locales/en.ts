@@ -350,6 +350,8 @@ export const translations: TranslationCatalog = {
   'playback.motionHere': 'motion',
   'playback.motionScoring': 'scoring motion…',
   'playback.motionScoringProgress': 'Scoring motion for this day: {{percent}}%',
+  'playback.noSound': 'no sound recorded',
+  'playback.soundAt1x': 'sound plays at 1x',
   'playback.prevActivity': 'Previous activity',
   'playback.nextActivity': 'Next activity',
   'playback.skipQuiet': 'Skip quiet stretches while playing',

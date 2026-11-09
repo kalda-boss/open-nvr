@@ -98,11 +98,17 @@ interface Engine {
   create: (ctx: AudioContext) => ModelNode
 }
 
-type Model = Exclude<VoiceFocusLevel, 'off'>
+export type Model = Exclude<VoiceFocusLevel, 'off'>
 
 let sharedCtx: AudioContext | null = null
 const enginePromises: Partial<Record<Model, Promise<Engine>>> = {}
 let activeChains = 0
+
+/** The page's one AudioContext (48 kHz), shared by live voice focus and
+    recorded-playback sound. */
+export function audioContext(): AudioContext {
+  return context()
+}
 
 function context(): AudioContext {
   if (!sharedCtx || sharedCtx.state === 'closed') {
@@ -132,6 +138,13 @@ function preferPlaybackSession(): void {
  */
 export function primeVoiceFocusAudio(): void {
   if (!voiceFocusSupported()) return
+  primeAudioOutput()
+}
+
+/** Same as primeVoiceFocusAudio, for sound that needs no worklet (recorded
+    playback): call it inside the click that turns sound on. */
+export function primeAudioOutput(): void {
+  if (typeof AudioContext === 'undefined') return
   try {
     preferPlaybackSession()
     const ctx = context()
@@ -173,6 +186,28 @@ function engine(model: Model): Promise<Engine> {
   return p
 }
 
+/** A voice-focus model node on the shared context. Rejects if it can't load. */
+export async function createVoiceFocusNode(level: Model): Promise<ModelNode> {
+  const { ctx, create } = await engine(level)
+  return create(ctx)
+}
+export type { ModelNode as VoiceFocusNode }
+
+/** Keep the shared context running while something plays through it; the
+    returned release lets it sleep again once nothing does (battery). */
+export function holdAudioContext(): () => void {
+  activeChains += 1
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    activeChains -= 1
+    if (activeChains === 0 && sharedCtx?.state === 'running') {
+      void sharedCtx.suspend().catch(() => {})
+    }
+  }
+}
+
 // --- one tile's chain -------------------------------------------------------
 
 export class VoiceFocusChain {
@@ -182,7 +217,7 @@ export class VoiceFocusChain {
   private sink: HTMLAudioElement | null = null
   private ctx: AudioContext | null = null
   private level = 1
-  private counted = false
+  private release: (() => void) | null = null
   private stopped = false
 
   constructor(
@@ -196,8 +231,7 @@ export class VoiceFocusChain {
     const { ctx, create } = await engine(this.model)
     if (this.stopped) return
     this.ctx = ctx
-    activeChains += 1
-    this.counted = true
+    this.release = holdAudioContext()
 
     const stream = new MediaStream([this.track])
     // Chrome only feeds a REMOTE WebRTC track into Web Audio while some media
@@ -253,13 +287,8 @@ export class VoiceFocusChain {
       this.sink.srcObject = null
     }
     this.source = this.node = this.gain = this.sink = null
-    if (this.counted) {
-      activeChains -= 1
-      this.counted = false
-      // Nothing playing through it: let the audio thread sleep (battery).
-      if (activeChains === 0 && this.ctx?.state === 'running') {
-        void this.ctx.suspend().catch(() => {})
-      }
-    }
+    // Nothing playing through it: let the audio thread sleep (battery).
+    this.release?.()
+    this.release = null
   }
 }

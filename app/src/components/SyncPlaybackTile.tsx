@@ -30,6 +30,9 @@ import type { FisheyeViewHandle } from './VideoPlayer'
 import { useTranslation } from '../i18n'
 import { loadHls } from '../lib/loadHls'
 import type { TimelineSegment } from './PlaybackTimeline'
+import { recordedAudioFrom, useRecordedAudio } from '../hooks/useRecordedAudio'
+import type { RecordedAudioSource } from '../lib/recordedAudio'
+import type { VoiceFocusLevel } from '../lib/voiceFocus'
 
 interface SyncPlaybackTileProps {
   cameraId: number
@@ -50,6 +53,11 @@ interface SyncPlaybackTileProps {
   displayAspectOverride?: AspectOverride | null
   /** 360° fisheye lens — see lib/fisheye.ts. */
   fisheye?: FisheyeLens | null
+  /** Background-noise filter on this tile's sound (lib/voiceFocus.ts). */
+  voiceFocus?: VoiceFocusLevel
+  /** Whether the loaded clip has sound (cameras without a mic, or with AAC
+      sound, have none to play). */
+  onSound?: (cameraId: number, hasSound: boolean) => void
 }
 
 type TileStatus = 'idle' | 'loading' | 'ok' | 'gap' | 'live' | 'error'
@@ -77,6 +85,8 @@ export function SyncPlaybackTile({
   onActivate,
   displayAspectOverride,
   fisheye,
+  voiceFocus = 'off',
+  onSound,
 }: SyncPlaybackTileProps) {
   const { t } = useTranslation()
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -104,6 +114,12 @@ export function SyncPlaybackTile({
 
   const [status, setStatus] = useState<TileStatus>('idle')
   const [buffering, setBuffering] = useState(false)
+  // The loaded clip's sound. Fetched only while this tile is heard (selected,
+  // unmuted) at 1x — never for the rest of the grid or at speed.
+  const [audioSrc, setAudioSrc] = useState<RecordedAudioSource | null>(null)
+  useRecordedAudio(videoRef, audioSrc, { enabled: !muted && rate === 1, voiceFocus })
+  const onSoundRef = useRef(onSound)
+  onSoundRef.current = onSound
 
   const teardownMedia = useCallback(() => {
     if (hlsRef.current) {
@@ -149,6 +165,7 @@ export function SyncPlaybackTile({
       inFlightRef.current = { targetMs: anchorMs }
       teardownMedia()
       windowRef.current = null
+      setAudioSrc(null)
       setStatus('loading')
 
       let manifestUrl: string
@@ -174,6 +191,10 @@ export function SyncPlaybackTile({
           fileOffsetSec = res.data.file_offset_seconds || 0
         }
         if (!manifestUrl && !browserMp4Url) throw new Error('No manifest returned')
+        // Sound rides beside the remuxed (video-only) clip.
+        const sound = browserMp4Url ? recordedAudioFrom(res.data) : null
+        setAudioSrc(sound)
+        onSoundRef.current?.(cameraId, sound != null)
       } catch {
         if (token === loadTokenRef.current) {
           inFlightRef.current = null

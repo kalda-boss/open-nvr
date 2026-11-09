@@ -41,6 +41,14 @@ makes still-recording files just work: the playable tail grows with the file.
 
 ``remux_to_browser_mp4()`` still materializes a real file from the same index;
 it is kept as the reference implementation (test oracle) and for tooling.
+
+Sound rides alongside as a second virtual file. The same header scan notes
+where the ``ipcm`` audio sits (it costs no extra reads: the run tables are in
+the fragment headers already being parsed), and ``iter_audio_range()`` serves
+it as a plain 16-bit WAV aligned to the remuxed video's t=0, byte-swapped from
+the recording's big-endian PCM on the way out. Nothing reads audio from disk
+until a player asks for it, which the web app does only while someone has the
+sound on at 1x.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ import asyncio
 import os
 import struct
 import threading
+from array import array
 from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Iterator
@@ -271,6 +280,25 @@ class RemuxIndex:
     runs: tuple[tuple[int, int], ...]  # (source_offset, length)
     run_out_starts: tuple[int, ...]
     total_size: int
+    # -- the sound, as a second virtual file (empty when there is none we can
+    # serve). A 44-byte WAV header, then 16-bit little-endian PCM whose first
+    # frame plays at the video's t=0. ``audio_segments`` are (data_offset,
+    # source_offset, length); source_offset -1 is silence filling a gap.
+    audio_header: bytes = b""
+    audio_segments: tuple[tuple[int, int, int], ...] = ()
+    audio_data_starts: tuple[int, ...] = ()
+    audio_data_size: int = 0
+    audio_swap: bool = False  # source PCM is big-endian (the ISO default)
+    audio_sample_rate: int = 0
+    audio_channels: int = 0
+
+    @property
+    def has_audio(self) -> bool:
+        return self.audio_data_size > 0
+
+    @property
+    def audio_total_size(self) -> int:
+        return len(self.audio_header) + self.audio_data_size
 
 
 def build_remux_index(src_path: str | Path) -> RemuxIndex:
@@ -319,22 +347,31 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
         if video_track_id is None or stsd_entry is None:
             raise ValueError("no video track / sample entry")
 
-        # trex defaults for the video track
-        d_dur = d_size = d_flags = 0
+        audio = _pcm_audio_track(moov, moov_hdr)  # None: no sound we can serve
+        audio_track_id = audio["track_id"] if audio else None
+
+        # trex defaults per track
+        trex: dict[int, tuple[int, int, int]] = {}
         mvex = _find(moov, moov_hdr, len(moov), (b"mvex",))
         if mvex:
             for xo, xh, _xs in _find_all(moov, mvex[0] + mvex[1],
                                          mvex[0] + mvex[2], b"trex"):
-                if struct.unpack(">I", moov[xo + xh + 4:xo + xh + 8])[0] == video_track_id:
-                    d_dur = struct.unpack(">I", moov[xo + xh + 12:xo + xh + 16])[0]
-                    d_size = struct.unpack(">I", moov[xo + xh + 16:xo + xh + 20])[0]
-                    d_flags = struct.unpack(">I", moov[xo + xh + 20:xo + xh + 24])[0]
+                tid = struct.unpack(">I", moov[xo + xh + 4:xo + xh + 8])[0]
+                trex[tid] = (
+                    struct.unpack(">I", moov[xo + xh + 12:xo + xh + 16])[0],
+                    struct.unpack(">I", moov[xo + xh + 16:xo + xh + 20])[0],
+                    struct.unpack(">I", moov[xo + xh + 20:xo + xh + 24])[0],
+                )
 
         # -- index all fragments: per-sample (size,dur,sync) + contiguous runs --
         sample_sizes: list[int] = []
         sample_durs: list[int] = []
         sync_samples: list[int] = []  # 1-based indices
         runs: list[tuple[int, int]] = []  # (file_offset, run_length) video-only
+        # first video decode time (video timescale): what the remux's t=0 is
+        video_t0: int | None = None
+        # sound: (decode time in audio timescale or None, file_offset, length)
+        audio_frags: list[tuple[int | None, int, int]] = []
         file_size = _file_size(f)
         for typ, pos, hdr, size in _iter_top_level(f):
             if typ != b"moof":
@@ -350,6 +387,8 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
             frag_durs: list[int] = []
             frag_sync: list[int] = []
             frag_runs: list[tuple[int, int]] = []
+            frag_audio: list[tuple[int | None, int, int]] = []
+            frag_video_t0: int | None = None
             for tro, trh, trs in _find_all(moof, hdr, size, b"traf"):
                 tfhd = _find(moof, tro + trh, tro + trs, (b"tfhd",))
                 to2, th2, _ts2 = tfhd
@@ -363,7 +402,9 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
                     p += 8
                 if tf_flags & 0x02:
                     p += 4
-                td, tsz, tfl = d_dur, d_size, d_flags
+                if track_id not in (video_track_id, audio_track_id):
+                    continue
+                td, tsz, tfl = trex.get(track_id, (0, 0, 0))
                 if tf_flags & 0x08:
                     td = struct.unpack(">I", moof[p:p + 4])[0]
                     p += 4
@@ -373,9 +414,16 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
                 if tf_flags & 0x20:
                     tfl = struct.unpack(">I", moof[p:p + 4])[0]
                     p += 4
-                if track_id != video_track_id:
-                    continue
+                tfdt = _find(moof, tro + trh, tro + trs, (b"tfdt",))
+                decode_time = None
+                if tfdt:
+                    fo = tfdt[0] + tfdt[1]
+                    decode_time = (struct.unpack(">Q", moof[fo + 4:fo + 12])[0]
+                                   if moof[fo] == 1
+                                   else struct.unpack(">I", moof[fo + 4:fo + 8])[0])
                 trun = _find(moof, tro + trh, tro + trs, (b"trun",))
+                if not trun:
+                    continue
                 uo, uh, _us = trun
                 tr_flags = struct.unpack(">I", moof[uo + uh:uo + uh + 4])[0] & 0xFFFFFF
                 q = uo + uh + 4
@@ -390,6 +438,22 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
                     first_flags = struct.unpack(">I", moof[q:q + 4])[0]
                     q += 4
                 run_start = base + data_off
+                if track_id == audio_track_id:
+                    # PCM: only the byte run matters; its length IS its duration
+                    if tr_flags & 0x200:
+                        per = 4 * (bin(tr_flags & 0xF00).count("1"))
+                        alen = 0
+                        sz_at = 4 * (bin(tr_flags & 0x100).count("1"))
+                        for i in range(count):
+                            o = q + i * per + sz_at
+                            alen += struct.unpack(">I", moof[o:o + 4])[0]
+                    else:
+                        alen = tsz * count
+                    if alen:
+                        frag_audio.append((decode_time, run_start, alen))
+                    continue
+                if frag_video_t0 is None:
+                    frag_video_t0 = decode_time
                 run_len = 0
                 for idx in range(count):
                     sdur, ssz, sfl = td, tsz, tfl
@@ -418,8 +482,13 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
             # Commit the fragment only if every byte it describes is on disk.
             # Otherwise the recording is still being written here: stop, and the
             # index covers exactly the footage that has finished.
-            if any(rs + rl > file_size for rs, rl in frag_runs):
+            if any(rs + rl > file_size for rs, rl in frag_runs) or any(
+                rs + rl > file_size for _t, rs, rl in frag_audio
+            ):
                 break
+            if not sample_sizes and frag_sizes:
+                video_t0 = frag_video_t0
+            audio_frags.extend(frag_audio)
             sample_sizes.extend(frag_sizes)
             sample_durs.extend(frag_durs)
             sync_samples.extend(frag_sync)
@@ -497,6 +566,14 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
         run_out_starts.append(out)
         out += rl
 
+    audio_fields: dict = {}
+    if audio and audio_frags:
+        audio_fields = _audio_layout(
+            audio, audio_frags,
+            video_t0_sec=(video_t0 / timescale) if (video_t0 is not None and timescale) else 0.0,
+            video_dur_sec=total_dur / timescale if timescale else 0.0,
+        )
+
     return RemuxIndex(
         src_path=os.path.abspath(src_path),
         src_size=st.st_size,
@@ -505,7 +582,205 @@ def build_remux_index(src_path: str | Path) -> RemuxIndex:
         runs=tuple(runs),
         run_out_starts=tuple(run_out_starts),
         total_size=out,
+        **audio_fields,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sound: the recording's PCM track as a WAV aligned to the remuxed video
+# ---------------------------------------------------------------------------
+
+# Corrections smaller than this are ignored, so ordinary timestamp jitter
+# between fragments never turns into clicks; a real gap (a dropped packet run)
+# becomes silence and an overlap is trimmed, keeping sound on the picture.
+_AUDIO_RESYNC_SEC = 0.04
+
+
+def _pcm_audio_track(moov: bytes, moov_hdr: int) -> dict | None:
+    """The first sound track, if it is 16-bit PCM (``ipcm``/``sowt``/``twos``),
+    which is how MediaMTX stores G.711. Anything else (AAC, Opus) -> None."""
+    for to, th, ts in _find_all(moov, moov_hdr, len(moov), b"trak"):
+        hd = _find(moov, to + th, to + ts, (b"mdia", b"hdlr"))
+        if not hd or moov[hd[0] + hd[1] + 8:hd[0] + hd[1] + 12] != b"soun":
+            continue
+        stsd = _find(moov, to + th, to + ts, (b"mdia", b"minf", b"stbl", b"stsd"))
+        tk = _find(moov, to + th, to + ts, (b"tkhd",))
+        md = _find(moov, to + th, to + ts, (b"mdia", b"mdhd"))
+        if not (stsd and tk and md):
+            return None
+        e = stsd[0] + stsd[1] + 8
+        esize = struct.unpack(">I", moov[e:e + 4])[0]
+        fourcc = moov[e + 4:e + 8]
+        if fourcc not in (b"ipcm", b"sowt", b"twos") or esize < 36:
+            return None
+        channels, bits = struct.unpack(">HH", moov[e + 24:e + 28])
+        rate = struct.unpack(">I", moov[e + 32:e + 36])[0] >> 16
+        big_endian = fourcc != b"sowt"
+        if fourcc == b"ipcm":
+            pc = _find(moov, e + 36, e + esize, (b"pcmC",))
+            if pc:
+                fmt_flags, bits = moov[pc[0] + pc[1] + 4], moov[pc[0] + pc[1] + 5]
+                big_endian = not (fmt_flags & 0x01)
+        tver = moov[tk[0] + tk[1]]
+        tid_off = tk[0] + tk[1] + (20 if tver == 1 else 12)
+        mver = moov[md[0] + md[1]]
+        tsc_off = md[0] + md[1] + (20 if mver == 1 else 12)
+        if bits != 16 or not (1 <= channels <= 2) or not rate:
+            return None
+        return {
+            "track_id": struct.unpack(">I", moov[tid_off:tid_off + 4])[0],
+            "timescale": struct.unpack(">I", moov[tsc_off:tsc_off + 4])[0] or rate,
+            "rate": rate,
+            "channels": channels,
+            "big_endian": big_endian,
+        }
+    return None
+
+
+def _wav_header(rate: int, channels: int, data_size: int) -> bytes:
+    block = channels * 2
+    return (b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, rate, rate * block, block, 16)
+            + b"data" + struct.pack("<I", data_size))
+
+
+def _audio_layout(audio: dict, frags: list[tuple[int | None, int, int]],
+                  video_t0_sec: float, video_dur_sec: float) -> dict:
+    """Lay the PCM fragments out on the video's timeline (data byte 0 = video
+    t=0), using each fragment's decode time when the file has them."""
+    rate, frame = audio["rate"], 2 * audio["channels"]
+    tol = int(_AUDIO_RESYNC_SEC * rate) * frame
+    segments: list[tuple[int, int, int]] = []
+    pos = 0  # data bytes laid out so far
+    clock = 0  # source bytes seen so far (time base when there is no tfdt)
+    for decode_time, src, length in frags:
+        length -= length % frame
+        if decode_time is not None:
+            t = decode_time / audio["timescale"]
+        else:
+            t = (clock // frame) / rate
+        clock += length
+        want = round((t - video_t0_sec) * rate) * frame
+        # The first fragment is placed exactly (that IS the sync with the
+        # picture); later ones only when they drift past the tolerance.
+        t_ok = tol if segments else 0
+        if want - pos > t_ok:  # a hole in the sound: fill with silence
+            segments.append((pos, -1, want - pos))
+            pos = want
+        elif pos - want > t_ok:  # overlap, or sound before the picture starts
+            cut = min(length, pos - want)
+            src, length = src + cut, length - cut
+        if length > 0:
+            segments.append((pos, src, length))
+            pos += length
+    # Don't run past the picture (a trailing silence would just play on).
+    limit = int(video_dur_sec * rate) * frame + rate // 2 * frame
+    if video_dur_sec and pos > limit:
+        clipped: list[tuple[int, int, int]] = []
+        for d, s, n in segments:
+            if d >= limit:
+                break
+            clipped.append((d, s, min(n, limit - d)))
+        segments, pos = clipped, limit
+    if not segments or pos <= 0:
+        return {}
+    return {
+        "audio_header": _wav_header(rate, audio["channels"], pos),
+        "audio_segments": tuple(segments),
+        "audio_data_starts": tuple(d for d, _s, _n in segments),
+        "audio_data_size": pos,
+        "audio_swap": audio["big_endian"],
+        "audio_sample_rate": rate,
+        "audio_channels": audio["channels"],
+    }
+
+
+def _iter_audio_data(index: RemuxIndex, start: int, end: int,
+                     chunk: int) -> Iterator[bytes]:
+    """Raw source PCM for data bytes [start, end] (inclusive), as stored."""
+    src: BinaryIO | None = None
+    pos = start
+    try:
+        i = bisect_right(index.audio_data_starts, pos) - 1
+        while pos <= end and i < len(index.audio_segments):
+            d0, s0, n = index.audio_segments[i]
+            within = pos - d0
+            need = min(n - within, end - pos + 1)
+            if need <= 0:
+                i += 1
+                continue
+            if s0 < 0:
+                while need > 0:
+                    k = min(chunk, need)
+                    yield bytes(k)
+                    need -= k
+                    pos += k
+            else:
+                if src is None:
+                    # Through the host reader when there is one. The sound sits
+                    # in ~1 s pieces between the video, so fetch just each
+                    # piece (small block), not the video around it.
+                    src = open_recording(
+                        index.src_path, block=16 * 1024, offset=s0 + within
+                    )
+                src.seek(s0 + within)
+                while need > 0:
+                    data = src.read(min(chunk, need))
+                    if not data:
+                        recording_logger.warning(
+                            "virtual audio: source truncated mid-read: %s", index.src_path
+                        )
+                        return
+                    yield data
+                    need -= len(data)
+                    pos += len(data)
+            i += 1
+    finally:
+        if src is not None:
+            src.close()
+
+
+def iter_audio_range(
+    index: RemuxIndex, start: int, end: int, chunk: int = 64 * 1024
+) -> Iterator[bytes]:
+    """Yield the virtual WAV's bytes for the INCLUSIVE range [start, end]."""
+    total = index.audio_total_size
+    if not index.has_audio or start < 0 or end >= total or start > end:
+        return
+    hlen = len(index.audio_header)
+    if start < hlen:
+        upto = min(end, hlen - 1)
+        yield index.audio_header[start:upto + 1]
+        start = upto + 1
+        if start > end:
+            return
+    d0, d1 = start - hlen, end - hlen
+    swap = index.audio_swap
+    # Swapping works on whole 16-bit samples: read from the even byte at or
+    # before d0, and carry an odd byte over between source reads.
+    a0 = d0 - (d0 % 2) if swap else d0
+    skip = d0 - a0
+    left = d1 - d0 + 1
+    carry = b""
+    # with swapping, also read through the end of the last sample touched
+    a1 = min(d1 + (1 - d1 % 2), index.audio_data_size - 1) if swap else d1
+    for data in _iter_audio_data(index, a0, a1, chunk - chunk % 2):
+        if swap:
+            data = carry + data
+            even = len(data) - len(data) % 2
+            carry = data[even:]
+            arr = array("h", data[:even])
+            arr.byteswap()  # a byte operation: BE pairs -> LE, on any host
+            data = arr.tobytes()
+        if skip:
+            data, skip = data[skip:], max(0, skip - len(data))
+        if not data:
+            continue
+        if len(data) >= left:
+            yield data[:left]
+            return
+        yield data
+        left -= len(data)
 
 
 def iter_index_range(
