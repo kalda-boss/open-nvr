@@ -22,14 +22,23 @@
 // dog), because those are often the point of a security clip. Only what this
 // viewer hears is filtered, and only while they have it switched on.
 //
-// The model is RNNoise (xiph, BSD) compiled to WebAssembly, run in an
-// AudioWorklet by @sapphi-red/web-noise-suppressor (MIT). It works on 48 kHz
-// audio in 10 ms frames; the cameras send 8 kHz G.711, which WebRTC decodes
-// and the AudioContext resamples, so the model just sees an empty top band.
+// Two strengths, both WebAssembly models run in an AudioWorklet by
+// @sapphi-red/web-noise-suppressor (MIT):
+//
+//   standard — RNNoise (xiph, BSD). Very light (<1% of a core per stream) and
+//              gentle: it clears hiss and hum but leaves anything voice-like,
+//              including most of a song playing over a store speaker.
+//   strong   — GTCRN (MIT). A newer, larger model (~2% of a core per stream)
+//              that also takes the music bed and most of a song's backing out
+//              (about 10 dB more than RNNoise on Register 2). A sung vocal is
+//              still a human voice, so no voice filter removes it entirely.
+//
+// Both take 48 kHz audio; the cameras send 8 kHz G.711, which WebRTC decodes
+// and the AudioContext resamples, so the models just see an empty top band.
 //
 // Graph, one per playing tile, all on one shared AudioContext:
 //
-//   remote WebRTC audio track -> RNNoise worklet -> gain (volume) -> speakers
+//   remote WebRTC audio track -> model worklet -> gain (volume) -> speakers
 //
 // While it runs, the <video> element is held muted so the raw audio isn't
 // heard underneath the filtered copy; VideoPlayer owns that half.
@@ -37,10 +46,19 @@
 import rnnoiseWorkletUrl from '@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url'
 import rnnoiseWasmUrl from '@sapphi-red/web-noise-suppressor/rnnoise.wasm?url'
 import rnnoiseSimdWasmUrl from '@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url'
+import gtcrnWorkletUrl from '@sapphi-red/web-noise-suppressor/gtcrnWorklet.js?url'
+import gtcrnWasmUrl from '@sapphi-red/web-noise-suppressor/gtcrn.wasm?url'
 
 const PREF_KEY = 'opennvr.voiceFocus'
-/** RNNoise is built for 48 kHz and does not resample on its own. */
+/** RNNoise is built for 48 kHz and does not resample on its own (GTCRN takes
+    16 or 48 kHz). */
 const SAMPLE_RATE = 48000
+
+export type VoiceFocusLevel = 'off' | 'standard' | 'strong'
+/** What the toggle moves to next: off -> standard -> strong -> off. */
+export function nextVoiceFocusLevel(level: VoiceFocusLevel): VoiceFocusLevel {
+  return level === 'off' ? 'standard' : level === 'standard' ? 'strong' : 'off'
+}
 
 /** The browser can run the worklet at all (AudioWorklet needs a secure context). */
 export function voiceFocusSupported(): boolean {
@@ -53,18 +71,19 @@ export function voiceFocusSupported(): boolean {
   )
 }
 
-/** This viewer's on/off choice. Off unless they turned it on. */
-export function readVoiceFocusPref(): boolean {
+/** This viewer's choice. Off unless they turned it on. */
+export function readVoiceFocusPref(): VoiceFocusLevel {
   try {
-    return localStorage.getItem(PREF_KEY) === '1'
+    const v = localStorage.getItem(PREF_KEY)
+    return v === '2' ? 'strong' : v === '1' ? 'standard' : 'off'
   } catch {
-    return false
+    return 'off'
   }
 }
 
-export function writeVoiceFocusPref(on: boolean): void {
+export function writeVoiceFocusPref(level: VoiceFocusLevel): void {
   try {
-    localStorage.setItem(PREF_KEY, on ? '1' : '0')
+    localStorage.setItem(PREF_KEY, level === 'strong' ? '2' : level === 'standard' ? '1' : '0')
   } catch {
     // private mode / blocked storage: the toggle still works for this page
   }
@@ -72,17 +91,17 @@ export function writeVoiceFocusPref(on: boolean): void {
 
 // --- shared engine --------------------------------------------------------
 
-type RnnoiseNodeCtor = typeof import('@sapphi-red/web-noise-suppressor').RnnoiseWorkletNode
-type RnnoiseNode = InstanceType<RnnoiseNodeCtor>
+type ModelNode = AudioWorkletNode & { destroy(): void }
 
 interface Engine {
   ctx: AudioContext
-  wasm: ArrayBuffer
-  Node: RnnoiseNodeCtor
+  create: (ctx: AudioContext) => ModelNode
 }
 
+type Model = Exclude<VoiceFocusLevel, 'off'>
+
 let sharedCtx: AudioContext | null = null
-let enginePromise: Promise<Engine> | null = null
+const enginePromises: Partial<Record<Model, Promise<Engine>>> = {}
 let activeChains = 0
 
 function context(): AudioContext {
@@ -122,32 +141,43 @@ export function primeVoiceFocusAudio(): void {
   }
 }
 
-function engine(): Promise<Engine> {
-  if (!enginePromise) {
-    enginePromise = (async () => {
+/** Load one model (wasm + worklet) once per page; each is fetched only when
+    first used, so a viewer on standard never downloads the strong model. */
+function engine(model: Model): Promise<Engine> {
+  let p = enginePromises[model]
+  if (!p) {
+    p = (async (): Promise<Engine> => {
       // Imported lazily: the package's node classes extend AudioWorkletNode at
       // module load, which would throw on a browser without it.
       const mod = await import('@sapphi-red/web-noise-suppressor')
       const ctx = context()
+      if (model === 'strong') {
+        const [wasm] = await Promise.all([
+          mod.loadGtcrn({ url: gtcrnWasmUrl }),
+          ctx.audioWorklet.addModule(gtcrnWorkletUrl),
+        ])
+        return { ctx, create: (c) => new mod.GtcrnWorkletNode(c, { maxChannels: 1, wasmBinary: wasm }) }
+      }
       const [wasm] = await Promise.all([
         mod.loadRnnoise({ url: rnnoiseWasmUrl, simdUrl: rnnoiseSimdWasmUrl }),
         ctx.audioWorklet.addModule(rnnoiseWorkletUrl),
       ])
-      return { ctx, wasm, Node: mod.RnnoiseWorkletNode }
+      return { ctx, create: (c) => new mod.RnnoiseWorkletNode(c, { maxChannels: 1, wasmBinary: wasm }) }
     })()
+    enginePromises[model] = p
     // A failed load (offline, blocked) may be retried by the next chain.
-    enginePromise.catch(() => {
-      enginePromise = null
+    p.catch(() => {
+      if (enginePromises[model] === p) delete enginePromises[model]
     })
   }
-  return enginePromise
+  return p
 }
 
 // --- one tile's chain -------------------------------------------------------
 
 export class VoiceFocusChain {
   private source: MediaStreamAudioSourceNode | null = null
-  private node: RnnoiseNode | null = null
+  private node: ModelNode | null = null
   private gain: GainNode | null = null
   private sink: HTMLAudioElement | null = null
   private ctx: AudioContext | null = null
@@ -155,12 +185,15 @@ export class VoiceFocusChain {
   private counted = false
   private stopped = false
 
-  constructor(private readonly track: MediaStreamTrack) {}
+  constructor(
+    private readonly track: MediaStreamTrack,
+    private readonly model: Model,
+  ) {}
 
   /** Build the graph. Rejects if the model can't load; the caller then puts
       the raw audio back on the <video>. */
   async start(): Promise<void> {
-    const { ctx, wasm, Node } = await engine()
+    const { ctx, create } = await engine(this.model)
     if (this.stopped) return
     this.ctx = ctx
     activeChains += 1
@@ -177,7 +210,7 @@ export class VoiceFocusChain {
     this.sink = sink
 
     this.source = ctx.createMediaStreamSource(stream)
-    this.node = new Node(ctx, { maxChannels: 1, wasmBinary: wasm })
+    this.node = create(ctx)
     this.gain = ctx.createGain()
     this.gain.gain.value = this.level
     this.source.connect(this.node)

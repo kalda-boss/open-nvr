@@ -31,6 +31,7 @@ import { loadHls } from '../../lib/loadHls'
 import { resolveWhepSessionUrl } from '../../lib/streamUrl'
 import {
   VoiceFocusChain,
+  nextVoiceFocusLevel,
   primeVoiceFocusAudio,
   readVoiceFocusPref,
   voiceFocusSupported,
@@ -230,7 +231,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     // an audio ontrack, so they get no toggle.
     const voiceFocusAvailable =
       isLive && streamType === 'webrtc' && liveAudioTrack !== null && voiceFocusSupported()
-    const audioRouted = voiceFocusAvailable && voiceFocus && !voiceFocusFailed
+    const voiceFocusLevel = voiceFocusFailed ? 'off' : voiceFocus
+    const audioRouted = voiceFocusAvailable && voiceFocusLevel !== 'off'
     // Read by the element's volumechange listener, which is bound once.
     const audioRoutedRef = useRef(audioRouted)
     audioRoutedRef.current = audioRouted
@@ -963,7 +965,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     // wall of muted tiles costs nothing.
     useEffect(() => {
       if (!audioRouted || isMuted || !liveAudioTrack) return
-      const chain = new VoiceFocusChain(liveAudioTrack)
+      const chain = new VoiceFocusChain(liveAudioTrack, voiceFocusLevel)
       voiceFocusChainRef.current = chain
       chain.setLevel(volume)
       chain.start().catch((e) => {
@@ -976,7 +978,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
       }
       // volume is applied by the effect below, without rebuilding the chain.
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [audioRouted, isMuted, liveAudioTrack])
+    }, [audioRouted, isMuted, liveAudioTrack, voiceFocusLevel])
 
     useEffect(() => {
       voiceFocusChainRef.current?.setLevel(volume)
@@ -1058,8 +1060,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     }
     const handleVoiceFocusToggle = () => {
       // A failed start reads as "off", so the next click retries it.
-      const next = !(voiceFocus && !voiceFocusFailed)
-      if (next) primeVoiceFocusAudio()
+      const next = nextVoiceFocusLevel(voiceFocusLevel)
+      if (next !== 'off') primeVoiceFocusAudio()
       writeVoiceFocusPref(next)
       setVoiceFocusFailed(false)
       setVoiceFocus(next)
@@ -1396,7 +1398,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
             onTogglePtz={onTogglePtz}
             ptzActive={ptzActive}
             talkCameraId={mode === 'live' ? cameraId : null}
-            voiceFocus={voiceFocusAvailable ? { on: voiceFocus && !voiceFocusFailed, onToggle: handleVoiceFocusToggle } : null}
+            voiceFocus={voiceFocusAvailable ? { level: voiceFocusLevel, onToggle: handleVoiceFocusToggle } : null}
             dewarpModes={dewarp.modes}
             dewarpMode={dewarp.mode}
             onDewarpModeChange={dewarp.setMode}

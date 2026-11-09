@@ -57,7 +57,7 @@ export interface VideoControlsProps {
   talkCameraId?: number | null
   /** Background-noise filter on the live audio (lib/voiceFocus.ts). Null
       hides the button: no audio track, not WebRTC, or no AudioWorklet. */
-  voiceFocus?: { on: boolean; onToggle: () => void } | null
+  voiceFocus?: { level: 'off' | 'standard' | 'strong'; onToggle: () => void } | null
   /** Fisheye layouts on offer; empty (the default) hides the picker. */
   dewarpModes?: DewarpMode[]
   dewarpMode?: DewarpMode
@@ -271,14 +271,26 @@ export function VideoControls({
         {voiceFocus && (
           <button
             onClick={voiceFocus.onToggle}
-            className={`p-1.5 rounded transition-colors flex-shrink-0 @max-[280px]:hidden ${
-              voiceFocus.on ? 'bg-[var(--accent)]/40 text-[var(--accent)]' : 'hover:bg-white/20'
+            className={`relative p-1.5 rounded transition-colors flex-shrink-0 @max-[280px]:hidden ${
+              voiceFocus.level === 'strong'
+                ? 'bg-[var(--accent)] text-white'
+                : voiceFocus.level === 'standard'
+                  ? 'bg-[var(--accent)]/40 text-[var(--accent)]'
+                  : 'hover:bg-white/20'
             }`}
-            title={voiceFocus.on ? t('video.voiceFocus.on') : t('video.voiceFocus.off')}
+            title={t(`video.voiceFocus.${voiceFocus.level}`)}
             aria-label={t('video.voiceFocus.label')}
-            aria-pressed={voiceFocus.on}
+            aria-pressed={voiceFocus.level !== 'off'}
           >
             <AudioLines size={18} />
+            {voiceFocus.level === 'strong' && (
+              <span
+                aria-hidden
+                className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-[2px] rounded-full bg-white text-[var(--accent)] text-[10px] font-bold leading-[14px] text-center"
+              >
+                +
+              </span>
+            )}
           </button>
         )}
 
