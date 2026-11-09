@@ -85,6 +85,35 @@ returns. `scripts/deploy.sh` therefore:
 
 `--check` runs steps 1 and 2 and the target checks, then stops.
 
+## Fast playback: the host recording reader
+
+On this Mac, Docker Desktop's file sharing reads the recordings drive at a
+few MB/s, with ~10 ms per small read, while the Mac itself reads it at
+100+ MB/s. One camera at 8x needs about 4.5 MB/s, so fast playback stalled.
+`scripts/recording-reader/` runs a small read-only file server on the host
+(loopback only, port 8790, token-protected, confined to `RECORDINGS_PATH`),
+and core reads recordings through it via `host.docker.internal`.
+
+```sh
+scripts/recording-reader/install.sh --env "$PWD/.env"    # install or update
+scripts/recording-reader/install.sh --uninstall --env "$PWD/.env"
+```
+
+It installs a LaunchAgent (`com.opennvr.recording-reader`, log in
+`~/Library/Logs/opennvr-recording-reader.log`) and sets
+`RECORDING_READER_URL`/`RECORDING_READER_TOKEN` in `.env`; core picks them up
+the next time it is created (`scripts/deploy.sh` or `./start.sh up`). It never
+touches the recorder.
+
+macOS must allow `/usr/bin/python3` to read the external drive, once: System
+Settings > Privacy & Security > Full Disk Access, add `/usr/bin/python3`
+(Cmd-Shift-G to type the path) and switch it on. Without that the reader
+answers 503 and the installer says so.
+
+If the reader is stopped or unreachable, core falls back to the mount within
+one request (and retries the reader every 30 s), so playback only gets
+slower; a read that fails mid-file finishes from the mount.
+
 ## Reading the recorder's log
 
 Most of `docker logs opennvr_mediamtx` is this line, once a second for each

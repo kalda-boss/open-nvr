@@ -308,7 +308,12 @@ export function SyncPlaybackTile({
     if (!inWindow) {
       // A load for (roughly) this instant is already in flight — let it land;
       // it settles at the then-current master. A far-away target supersedes it.
-      if (inFlightRef.current && Math.abs(inFlightRef.current.targetMs - m) < 10_000) return
+      // "Far" ahead scales with speed: at 8x the master covers 10 s of footage
+      // in 1.25 s, less than a cold load takes, so a fixed 10 s abandoned
+      // every load and started another, never playing and piling work on the
+      // server. Allow ~6 s of real time instead.
+      const inFlight = inFlightRef.current
+      if (inFlight && m > inFlight.targetMs - 10_000 && m < inFlight.targetMs + Math.max(10_000, rate * 6_000)) return
       // Recent failure at this spot — wait for the master to move on.
       if (failRef.current && Math.abs(failRef.current.targetMs - m) < 5_000) return
       loadAt(seg, m)

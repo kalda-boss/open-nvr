@@ -713,6 +713,12 @@ services:
       - RECORDINGS_HOST_BASE=${RECORDINGS_PATH:-./recordings}
       - RECORDINGS_CONTAINER_BASE=/app/recordings
       - RECORDINGS_BASE_PATH=/app/recordings
+      # Host recording reader (macOS, scripts/recording-reader): playback reads
+      # recordings over HTTP from the host at 100+ MB/s instead of through
+      # Docker Desktop's file sharing (a few MB/s). Its install.sh sets these;
+      # unset, or the reader down = read the mount as before.
+      - RECORDING_READER_URL=${RECORDING_READER_URL:-}
+      - RECORDING_READER_TOKEN=${RECORDING_READER_TOKEN:-}
       # Motion bar on the playback timeline: background scoring of every
       # recorded clip (services/motion_index.py). Unset = on, 2 workers.
       - MOTION_INDEX_ENABLED=${MOTION_INDEX_ENABLED:-}
