@@ -67,6 +67,8 @@ import { useElementSize } from '../hooks/useElementSize'
 import { usePaneExtra } from '../hooks/usePaneExtra'
 import { MultiCamTimeline, type TimelineRow } from '../components/MultiCamTimeline'
 import { SyncPlaybackTile } from '../components/SyncPlaybackTile'
+import { VoiceFocusButton } from '../components/VoiceFocusButton'
+import { primeAudioOutput, readVoiceFocusPref, type VoiceFocusLevel } from '../lib/voiceFocus'
 import type { TimelineSegment } from '../components/PlaybackTimeline'
 
 interface DailyRecording {
@@ -229,7 +231,19 @@ export function SyncPlayback() {
   const [masterMs, setMasterMs] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [rateIdx, setRateIdx] = useState(RATE_1X)
-  const [muted, setMuted] = useState(false)
+  // Sound is off on every visit; one tap turns on the selected camera's.
+  const [muted, setMuted] = useState(true)
+  const [voiceFocus, setVoiceFocus] = useState<VoiceFocusLevel>(readVoiceFocusPref)
+  // Which cameras' loaded clips carry sound (false: no mic, or AAC sound).
+  const [soundByCam, setSoundByCam] = useState<Record<number, boolean>>({})
+  const onSound = useCallback(
+    (id: number, has: boolean) => setSoundByCam((m) => (m[id] === has ? m : { ...m, [id]: has })),
+    [],
+  )
+  const toggleMute = () => {
+    if (muted) primeAudioOutput() // inside the click: iOS needs the gesture
+    setMuted(!muted)
+  }
   const [view, setView] = useState<{ start: number; end: number }>({ start: 0, end: 0 })
   const [zoomIdx, setZoomIdx] = useState(0)
   const [previewMs, setPreviewMs] = useState<number | null>(null)
@@ -703,6 +717,8 @@ export function SyncPlayback() {
                 muted={muted || cam.camera_id !== activeId}
                 active={cam.camera_id === activeId}
                 onActivate={() => setActiveId(cam.camera_id)}
+                voiceFocus={voiceFocus}
+                onSound={onSound}
                 {...(cameraAspects[cam.camera_id] ?? {})}
               />
             ))
@@ -737,12 +753,18 @@ export function SyncPlayback() {
             </IconBtn>
           </div>
 
-          <IconBtn title={muted ? 'Unmute selected camera' : 'Mute'} onClick={() => setMuted((m) => !m)}>
+          <IconBtn title={muted ? 'Unmute selected camera' : 'Mute'} onClick={toggleMute}>
             {muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
           </IconBtn>
+          <VoiceFocusButton level={voiceFocus} onChange={setVoiceFocus} size={14} className="p-1" />
           {activeCam && (
-            <span className="text-[11px] text-[var(--text-dim)] truncate max-w-32" title={`Audio: ${activeCam.camera_name}`}>
+            <span className="text-[11px] text-[var(--text-dim)] truncate max-w-40" title={`Audio: ${activeCam.camera_name}`}>
               {activeCam.camera_name}
+              {!muted && soundByCam[activeCam.camera_id] === false
+                ? ` · ${t('playback.noSound')}`
+                : !muted && SPEEDS[rateIdx] !== 1
+                  ? ` · ${t('playback.soundAt1x')}`
+                  : ''}
             </span>
           )}
 

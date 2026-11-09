@@ -1262,10 +1262,23 @@ async def create_hls_session(
         else None
     )
 
+    # The recording's sound, served on its own beside the video-only remux.
+    # Offered when the clip has PCM sound (G.711 cameras); the player fetches
+    # it only while someone has the sound on at 1x.
+    index = session.remux_index if needs_remux else None
+    browser_audio_url = (
+        f"{settings.api_prefix}/recordings/playback/hls/{session.session_id}/audio.wav"
+        if index is not None and index.has_audio
+        else None
+    )
+
     return {
         "session_id": session.session_id,
         "manifest_url": manifest_url,
         "browser_mp4_url": browser_mp4_url,
+        "browser_audio_url": browser_audio_url,
+        "audio_sample_rate": index.audio_sample_rate if browser_audio_url else None,
+        "audio_channels": index.audio_channels if browser_audio_url else None,
         "video_codec": session.video_codec,
         "needs_remux": needs_remux,
         "file_offset_seconds": session.file_offset_seconds,
@@ -1494,6 +1507,52 @@ async def get_browser_playable_recording(
         iter_index_range(index, start, end),
         status_code=status_code,
         media_type="video/mp4",
+        headers=headers,
+    )
+
+
+@router.get("/playback/hls/{session_id}/audio.wav")
+async def get_browser_playable_audio(
+    session_id: str,
+    request: Request = None,
+):
+    """Serve a remuxed recording's sound as a 16-bit PCM WAV.
+
+    The companion of ``browser.mp4``: same frozen index, same session-id auth,
+    and its first sample plays at the video's t=0. Nothing here is read from
+    disk until a player asks; the web app asks only while the sound is on.
+    """
+    from fastapi.responses import StreamingResponse
+
+    from services.hevc_remux_service import get_remux_index, iter_audio_range
+    from services.hls_playback_service import HlsPlaybackService
+
+    session = await HlsPlaybackService.get_session(session_id)
+    if not session or not session.file_path:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    index = session.remux_index or await get_remux_index(session.file_path)
+    if index is None or not index.has_audio:
+        raise HTTPException(status_code=404, detail="This recording has no sound")
+
+    file_size = index.audio_total_size
+    range_header = request.headers.get("range") if request else None
+    start, end, status_code = 0, file_size - 1, 200
+    parsed = _parse_byte_range(range_header, file_size)
+    if parsed is not None:
+        start, end = parsed
+        status_code = 206
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+        "Cache-Control": "max-age=86400",
+    }
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+    return StreamingResponse(
+        iter_audio_range(index, start, end),
+        status_code=status_code,
+        media_type="audio/wav",
         headers=headers,
     )
 

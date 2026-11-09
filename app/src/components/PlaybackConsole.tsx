@@ -65,6 +65,10 @@ import { PaneResizer } from './PaneResizer'
 import { useElementSize } from '../hooks/useElementSize'
 import { usePaneExtra } from '../hooks/usePaneExtra'
 import { PlaybackTimeline, type TimelineSegment } from './PlaybackTimeline'
+import { VoiceFocusButton } from './VoiceFocusButton'
+import { recordedAudioFrom, useRecordedAudio } from '../hooks/useRecordedAudio'
+import type { RecordedAudioSource } from '../lib/recordedAudio'
+import { primeAudioOutput, readVoiceFocusPref, type VoiceFocusLevel } from '../lib/voiceFocus'
 
 interface RawSegment {
   start: string
@@ -212,7 +216,12 @@ export function PlaybackConsole({
   const [previewMs, setPreviewMs] = useState<number | null>(null)
   const [isPlaying, setIsPlaying] = useState(false)
   const [rateIdx, setRateIdx] = useState(RATE_1X)
-  const [muted, setMuted] = useState(false)
+  // Sound is off on every visit; the recording's sound (served beside the
+  // video-only remux) is fetched only while it's on, at 1x.
+  const [muted, setMuted] = useState(true)
+  const [voiceFocus, setVoiceFocus] = useState<VoiceFocusLevel>(readVoiceFocusPref)
+  const [audioSrc, setAudioSrc] = useState<RecordedAudioSource | null>(null)
+  useRecordedAudio(videoRef, audioSrc, { enabled: !muted && SPEEDS[rateIdx] === 1, voiceFocus })
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [buffering, setBuffering] = useState(false)
 
@@ -340,6 +349,7 @@ export function PlaybackConsole({
       setClipError(null)
 
       teardownHls()
+      setAudioSrc(null) // the old clip's sound must not play over the new one
 
       windowStartRef.current = clip.startMs
       loadedClipRef.current = { startMs: clip.startMs, endMs: clip.endMs }
@@ -384,6 +394,7 @@ export function PlaybackConsole({
           fileOffsetSec = res.data.file_offset_seconds || 0
         }
         if (!manifestUrl && !browserMp4Url) throw new Error('No manifest returned')
+        setAudioSrc(browserMp4Url ? recordedAudioFrom(res.data) : null)
       } catch {
         if (token === loadTokenRef.current) {
           setBuffering(false)
@@ -679,10 +690,10 @@ export function PlaybackConsole({
   }
 
   const toggleMute = () => {
-    const el = videoRef.current
-    if (!el) return
-    el.muted = !el.muted
-    setMuted(el.muted)
+    const next = !muted
+    if (!next) primeAudioOutput() // inside the click: iOS needs the gesture
+    if (videoRef.current) videoRef.current.muted = next
+    setMuted(next)
   }
 
   const toggleFullscreen = () => {
@@ -955,6 +966,7 @@ export function PlaybackConsole({
             <IconBtn title={muted ? 'Unmute' : 'Mute'} onClick={toggleMute}>
               {muted ? <VolumeX size={16} /> : <Volume2 size={16} />}
             </IconBtn>
+            <VoiceFocusButton level={voiceFocus} onChange={setVoiceFocus} />
 
             <button
               title={clipMode ? 'Exit clip mode' : 'Clip / export'}

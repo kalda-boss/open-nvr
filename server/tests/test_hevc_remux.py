@@ -349,3 +349,110 @@ async def test_index_lru_is_bounded(tmp_path, monkeypatch):
     assert len(hrs._indexes) == 2
     # newest two survive
     assert {Path(p).name for p in hrs._indexes} == {"rec2.mp4", "rec3.mp4"}
+
+
+# --- sound: the PCM track served as a WAV beside the video-only remux --------
+
+
+def _pcm_entry(rate: int = 8000, little_endian: bool = False) -> bytes:
+    body = (b"\x00" * 6 + struct.pack(">H", 1) + b"\x00" * 8
+            + struct.pack(">HH", 1, 16) + b"\x00" * 4 + struct.pack(">I", rate << 16))
+    pcmc = _full(b"pcmC", 0, 0, bytes([1 if little_endian else 0, 16]))
+    return _box(b"ipcm", body + pcmc)
+
+
+def _timed_traf(track_id: int, data_offset: int, sizes: list[int], decode_time: int) -> bytes:
+    tfhd = _full(b"tfhd", 0, 0x020000, struct.pack(">I", track_id))
+    tfdt = _full(b"tfdt", 1, 0, struct.pack(">Q", decode_time))
+    payload = struct.pack(">I", len(sizes)) + struct.pack(">i", data_offset) + struct.pack(">I", 0)
+    for sz in sizes:
+        payload += struct.pack(">I", sz)
+    return _box(b"traf", tfhd + tfdt + _full(b"trun", 0, 0x01 | 0x04 | 0x200, payload))
+
+
+def _timed_fmp4(frags: list[tuple[int, bytes, int, bytes]], acodec_entry: bytes | None = None) -> bytes:
+    """frags: (video decode time @90 kHz, video bytes, audio decode time @8 kHz,
+    big-endian PCM bytes). Audio is written BEFORE video in each mdat, as
+    MediaMTX does."""
+    ftyp = _box(b"ftyp", b"isom" + struct.pack(">I", 0x200) + b"isomiso5")
+    mvhd = _full(b"mvhd", 0, 0, struct.pack(">IIII", 0, 0, 1000, 0) + struct.pack(">IH", 0x10000, 0x0100)
+                 + b"\x00" * 10 + struct.pack(">IIIIIIIII", 0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000)
+                 + b"\x00" * 24 + struct.pack(">I", 3))
+    vtrak = _trak(1, b"vide", _visual_sample_entry(b"hev1"), 90000)
+    atrak = _trak(2, b"soun", acodec_entry if acodec_entry is not None else _pcm_entry(), 8000)
+    trex_v = _full(b"trex", 0, 0, struct.pack(">IIIII", 1, 1, 9000, 0, 0))  # 0.1 s frames
+    out = ftyp + _box(b"moov", mvhd + vtrak + atrak + _box(b"mvex", trex_v + _trex(2)))
+    for seq, (vt, vbytes, at, abytes) in enumerate(frags, start=1):
+        mfhd = _full(b"mfhd", 0, 0, struct.pack(">I", seq))
+
+        def build(a_off: int, v_off: int, mfhd=mfhd, at=at, vt=vt, na=len(abytes), nv=len(vbytes)) -> bytes:
+            return _box(b"moof", mfhd + _timed_traf(2, a_off, [na], at) + _timed_traf(1, v_off, [nv], vt))
+
+        start = len(build(0, 0)) + 8
+        out += build(start, start + len(abytes)) + _box(b"mdat", abytes + vbytes)
+    return out
+
+
+def _be(samples: list[int]) -> bytes:
+    return b"".join(struct.pack(">h", v) for v in samples)
+
+
+def _le(samples: list[int]) -> bytes:
+    return b"".join(struct.pack("<h", v) for v in samples)
+
+
+def test_sound_is_served_as_little_endian_wav_from_the_video_start(tmp_path):
+    """Video starts 0.01 s (80 samples) after the audio, as on real cameras:
+    the WAV must drop those 80 samples so sound and picture share t=0."""
+    a1 = list(range(1, 801))  # 0.1 s @ 8 kHz
+    a2 = list(range(-800, 0))
+    src = tmp_path / "rec.mp4"
+    src.write_bytes(_timed_fmp4([
+        (900, b"V" * 50, 0, _be(a1)),
+        (9900, b"W" * 50, 800, _be(a2)),
+    ]))
+    idx = hrs.build_remux_index(src)
+    assert idx.has_audio and idx.audio_sample_rate == 8000 and idx.audio_channels == 1
+    wav = b"".join(hrs.iter_audio_range(idx, 0, idx.audio_total_size - 1))
+    assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
+    assert struct.unpack("<I", wav[40:44])[0] == len(wav) - 44
+    assert wav[44:] == _le(a1[80:] + a2)
+    # the video is untouched by all this
+    body = b"".join(hrs.iter_index_range(idx, len(idx.header), idx.total_size - 1))
+    assert body == b"V" * 50 + b"W" * 50
+
+
+def test_sound_gap_becomes_silence_and_any_range_matches(tmp_path):
+    a1, a2 = list(range(1, 801)), list(range(1000, 1800))
+    src = tmp_path / "rec.mp4"
+    # second audio fragment starts 0.5 s later than the first one ends
+    src.write_bytes(_timed_fmp4([
+        (0, b"V" * 10, 0, _be(a1)),
+        (9000, b"W" * 10, 800 + 4000, _be(a2)),
+    ]))
+    idx = hrs.build_remux_index(src)
+    whole = b"".join(hrs.iter_audio_range(idx, 0, idx.audio_total_size - 1))
+    assert whole[44:] == _le(a1) + bytes(8000) + _le(a2)
+    # odd starts and ends cut through byte-swapped samples correctly
+    for a, b in [(0, 0), (43, 46), (45, 45), (47, 1650), (1645, 9640), (101, whole.__len__() - 1)]:
+        assert b"".join(hrs.iter_audio_range(idx, a, b, chunk=7)) == whole[a:b + 1], (a, b)
+    assert b"".join(hrs.iter_audio_range(idx, len(whole), len(whole) + 5)) == b""
+
+
+def test_little_endian_pcm_is_passed_through(tmp_path):
+    a1 = list(range(1, 801))
+    src = tmp_path / "rec.mp4"
+    src.write_bytes(_timed_fmp4([(0, b"V", 0, _le(a1))], acodec_entry=_pcm_entry(little_endian=True)))
+    idx = hrs.build_remux_index(src)
+    assert not idx.audio_swap
+    assert b"".join(hrs.iter_audio_range(idx, 44, idx.audio_total_size - 1)) == _le(a1)
+
+
+def test_no_sound_served_for_aac_or_silent_cameras(tmp_path):
+    aac = tmp_path / "aac.mp4"
+    aac.write_bytes(_timed_fmp4([(0, b"V", 0, b"\x01\x02")], acodec_entry=_audio_sample_entry(b"mp4a")))
+    assert not hrs.build_remux_index(aac).has_audio
+    mute = tmp_path / "mute.mp4"
+    mute.write_bytes(_build_fmp4([b"AAAA"], [], acodec=None))
+    idx = hrs.build_remux_index(mute)
+    assert not idx.has_audio and list(hrs.iter_audio_range(idx, 0, 10)) == []
