@@ -236,6 +236,7 @@ export const translations: TranslationCatalog = {
   'live.showToolbar': 'Show toolbar',
   'live.layouts': 'Layouts',
   'live.menu': 'Menu', 'live.fill': 'Fill', 'live.fit': 'Fit', 'live.boxes': 'Detections', 'live.fullscreen': 'Fullscreen', 'live.configureLayouts': 'Configure Layouts…',
+  'live.soundOn': 'Turn sound on', 'live.soundOff': 'Mute',
   'live.viewSingle': 'One camera', 'live.viewQuad': 'Four cameras', 'live.cameraList': 'Cameras',
   'live.pickForTile': 'Tap a camera to show it in tile {{n}}', 'live.pickFromList': 'Pick a camera from the list',
   'live.tileN': 'Tile {{n}}', 'live.inTileN': 'On screen in tile {{n}}', 'live.showAlone': 'Show this camera alone',
