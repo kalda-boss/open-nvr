@@ -20,7 +20,7 @@ import { useRef, useEffect, useState, useCallback } from 'react'
 import {
   Play, Pause, Volume2, VolumeX, Maximize, Minimize,
   Settings, Camera, SkipBack, SkipForward, RefreshCw,
-  Loader2, Move
+  Loader2, Move, AudioLines
 } from 'lucide-react'
 import { useTranslation } from '../../i18n'
 import type { DewarpMode } from '../../lib/fisheye'
@@ -55,6 +55,9 @@ export interface VideoControlsProps {
   ptzActive?: boolean
   /** Live camera to offer push-to-talk for; the button hides itself when it can't talk. */
   talkCameraId?: number | null
+  /** Background-noise filter on the live audio (lib/voiceFocus.ts). Null
+      hides the button: no audio track, not WebRTC, or no AudioWorklet. */
+  voiceFocus?: { level: 'off' | 'standard' | 'strong'; onToggle: () => void } | null
   /** Fisheye layouts on offer; empty (the default) hides the picker. */
   dewarpModes?: DewarpMode[]
   dewarpMode?: DewarpMode
@@ -88,6 +91,7 @@ export function VideoControls({
   onTogglePtz,
   ptzActive = false,
   talkCameraId = null,
+  voiceFocus = null,
   dewarpModes = [],
   dewarpMode = 'fisheye',
   onDewarpModeChange,
@@ -262,6 +266,33 @@ export function VideoControls({
 
         {/* Talk (live only, cameras with a reachable speaker only) */}
         {isLive && talkCameraId != null && <TalkButton cameraId={talkCameraId} />}
+
+        {/* Voice focus (live WebRTC audio only) */}
+        {voiceFocus && (
+          <button
+            onClick={voiceFocus.onToggle}
+            className={`relative p-1.5 rounded transition-colors flex-shrink-0 @max-[280px]:hidden ${
+              voiceFocus.level === 'strong'
+                ? 'bg-[var(--accent)] text-white'
+                : voiceFocus.level === 'standard'
+                  ? 'bg-[var(--accent)]/40 text-[var(--accent)]'
+                  : 'hover:bg-white/20'
+            }`}
+            title={t(`video.voiceFocus.${voiceFocus.level}`)}
+            aria-label={t('video.voiceFocus.label')}
+            aria-pressed={voiceFocus.level !== 'off'}
+          >
+            <AudioLines size={18} />
+            {voiceFocus.level === 'strong' && (
+              <span
+                aria-hidden
+                className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-[2px] rounded-full bg-white text-[var(--accent)] text-[10px] font-bold leading-[14px] text-center"
+              >
+                +
+              </span>
+            )}
+          </button>
+        )}
 
         {/* Volume */}
         <div
