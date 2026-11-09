@@ -219,6 +219,17 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     useLayoutEffect(() => {
       if (mutedPropRef.current === muted) return
       mutedPropRef.current = muted
+      // Voice focus holds the element muted and plays a filtered copy; sound
+      // on/off is the player's state then. Unmuting the element here would
+      // play the raw audio underneath the filtered one.
+      if (audioRoutedRef.current) {
+        if (!muted) {
+          primeVoiceFocusAudio() // still inside the tap: iOS needs the gesture
+          if (volume === 0) setVolume(1)
+        }
+        setIsMuted(muted)
+        return
+      }
       const el = videoRef.current
       if (!el) return
       el.muted = muted
@@ -230,6 +241,8 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
           el.play().catch((e) => { if (e?.name === 'NotAllowedError') el.muted = true })
         }
       }
+      // volume is read only to restore it from 0, like the element path does.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [muted])
     const [isReconnecting, setIsReconnecting] = useState(false)
     // Voice focus (lib/voiceFocus.ts): this viewer's background-noise filter
@@ -1060,14 +1073,20 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
     const handlePause = () => videoRef.current?.pause()
     // While voice focus routes the audio, these drive React state (and so the
     // filter's gain) instead of the element, which stays muted.
+    // The element's volumechange can't report these (it stays muted), so tell
+    // the parent here, as that listener would have.
+    const setRoutedMuted = (m: boolean) => {
+      setIsMuted(m)
+      onMutedChangeRef.current?.(m)
+    }
     const handleMute = () => {
-      if (audioRoutedRef.current) setIsMuted(true)
+      if (audioRoutedRef.current) setRoutedMuted(true)
       else if (videoRef.current) videoRef.current.muted = true
     }
     const handleUnmute = () => {
       if (audioRoutedRef.current) {
         primeVoiceFocusAudio() // inside the click: iOS needs the gesture
-        setIsMuted(false)
+        setRoutedMuted(false)
         if (volume === 0) {
           if (videoRef.current) videoRef.current.volume = 0.5
           setVolume(0.5)
@@ -1087,7 +1106,7 @@ export const VideoPlayer = forwardRef<VideoPlayerHandle, VideoPlayerProps>(
         if (vol > 0) primeVoiceFocusAudio()
         if (videoRef.current) videoRef.current.volume = vol
         setVolume(vol)
-        setIsMuted(vol === 0)
+        setRoutedMuted(vol === 0)
         return
       }
       if (videoRef.current) {
