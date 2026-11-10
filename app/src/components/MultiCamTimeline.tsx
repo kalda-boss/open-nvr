@@ -237,6 +237,15 @@ export function MultiCamTimeline({
   const overlayRef = useRef<HTMLDivElement>(null)
   const lastXRef = useRef(0)
   const [dragging, setDragging] = useState(false)
+  // The same flag for the effect below, which can run after a release was
+  // handled but from a render that still saw the drag: React flushes a
+  // pending effect just before it renders the release, so its preview
+  // would land after the release cleared it and stick.
+  const draggingRef = useRef(false)
+  const setDrag = (on: boolean) => {
+    draggingRef.current = on
+    setDragging(on)
+  }
   const [hoverMs, setHoverMs] = useState<number | null>(null)
 
   const span = Math.max(1, viewEnd - viewStart)
@@ -313,7 +322,7 @@ export function MultiCamTimeline({
   const handleDown = (e: React.PointerEvent) => {
     if (!e.isPrimary) return
     e.currentTarget.setPointerCapture(e.pointerId)
-    setDragging(true)
+    setDrag(true)
     lastXRef.current = e.clientX
     autoPan.onDragStart(e.clientX)
     setHoverMs(xToMs(e.clientX))
@@ -331,7 +340,7 @@ export function MultiCamTimeline({
   const handleUp = (e: React.PointerEvent) => {
     if (!dragging) return
     autoPan.onDragEnd()
-    setDragging(false)
+    setDrag(false)
     onSeek(snap(xToMs(e.clientX)))
     onScrubPreview?.(null)
   }
@@ -343,7 +352,7 @@ export function MultiCamTimeline({
   const handleCancel = () => {
     if (!dragging) return
     autoPan.onDragEnd()
-    setDragging(false)
+    setDrag(false)
     setHoverMs(null)
     onScrubPreview?.(null)
   }
@@ -352,7 +361,7 @@ export function MultiCamTimeline({
   // re-derive the preview from the moving window instead. During a drag the
   // window only moves via onPan (auto-follow is suppressed by the preview).
   useEffect(() => {
-    if (!dragging) return
+    if (!draggingRef.current) return
     const ms = xToMs(lastXRef.current)
     setHoverMs(ms)
     onScrubPreview?.(snap(ms))

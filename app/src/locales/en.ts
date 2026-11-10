@@ -368,6 +368,7 @@ export const translations: TranslationCatalog = {
   'playback.back10': 'Back 10 seconds',
   'playback.forward10': 'Forward 10 seconds',
   'playback.speed': 'Playback speed',
+  'playback.timeline': 'Timeline',
   'playback.zoom': 'Timeline zoom',
   'calendar.weekdays': 'Su,Mo,Tu,We,Th,Fr,Sa',
   'calendar.months': 'January,February,March,April,May,June,July,August,September,October,November,December',

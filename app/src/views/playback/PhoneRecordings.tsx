@@ -59,8 +59,9 @@ import { useMediaQuery } from '../../hooks/useMediaQuery'
 import { useSnackbar } from '../../components/Snackbar'
 import { Modal } from '../../components/Modal'
 import { RecordingCalendar } from '../../components/RecordingCalendar'
-import { PlaybackTimeline, type TimelineSegment } from '../../components/PlaybackTimeline'
-import { MultiCamTimeline, type TimelineRow } from '../../components/MultiCamTimeline'
+import { ActivityTimeline } from '../../components/ActivityTimeline'
+import type { TimelineSegment } from '../../components/PlaybackTimeline'
+import type { TimelineRow } from '../../components/MultiCamTimeline'
 import { SyncPlaybackTile } from '../../components/SyncPlaybackTile'
 import { VoiceFocusButton } from '../../components/VoiceFocusButton'
 import { NO_PICTURE_BG } from '../live/LiveTile'
@@ -300,6 +301,25 @@ export function PhoneRecordings() {
   const camById = useMemo(() => new Map(cameras.map((c) => [c.camera_id, c])), [cameras])
   const recOn = (id: number) => (selectedDate ? ov.recByCamDate.get(id)?.get(selectedDate) : undefined)
 
+  // One timeline track per camera on screen. Memoized so the tracks, which
+  // are too, sit out the 4 Hz playhead re-renders.
+  const timelineRows: TimelineRow[] = useMemo(
+    () =>
+      view.ids.flatMap((id) => {
+        const cam = camById.get(id)
+        return cam
+          ? [{
+              id,
+              name: cam.camera_name,
+              segments: tp.segsByCam[id] || NO_SEGMENTS,
+              liveEdgeMs: tp.liveEdges[id] ?? null,
+              motion: tp.motionByCam[id] ?? null,
+            }]
+          : []
+      }),
+    [view.ids, camById, tp.segsByCam, tp.liveEdges, tp.motionByCam],
+  )
+
   const isLandscape = useMediaQuery('(orientation: landscape)')
 
   // ---- Fullscreen ----------------------------------------------------------
@@ -530,45 +550,18 @@ export function PhoneRecordings() {
     </div>
   )
 
-  const quadRows: TimelineRow[] = view.mode === 'quad'
-    ? view.ids.flatMap((id) => {
-        const cam = camById.get(id)
-        return cam
-          ? [{
-              id,
-              name: cam.camera_name,
-              segments: tp.segsByCam[id] || NO_SEGMENTS,
-              liveEdgeMs: tp.liveEdges[id] ?? null,
-              motion: tp.motionByCam[id] ?? null,
-            }]
-          : []
-      })
-    : []
   const timelineReady = tp.view.end > tp.view.start
-  // The wrapper keeps the timeline's full height while it loads and before
-  // the motion lane arrives, so the list below doesn't jump.
+  // The wrapper keeps the timeline's full height while it loads, so the
+  // list below doesn't jump.
   const timeline = (
-    <div className={clsx('flex flex-col justify-end px-4 pt-1', !overVideo && (view.mode === 'single' ? 'min-h-[6.25rem]' : 'min-h-[7.125rem]'))}>
+    <div className={clsx('flex flex-col justify-end px-4 pt-1', !overVideo && (view.mode === 'single' ? 'min-h-[6.75rem]' : 'min-h-[8.3125rem]'))}>
       {!timelineReady ? (
         <div className="flex-1 min-h-12 flex items-center justify-center text-[var(--text-dim)]">
           <Loader2 size={18} className="animate-spin" aria-label={t('playback.loadingRecordings')} />
         </div>
-      ) : view.mode === 'single' && view.single != null ? (
-        <PlaybackTimeline
-          segments={tp.segsByCam[view.single] || NO_SEGMENTS}
-          liveEdgeMs={tp.liveEdges[view.single] ?? null}
-          viewStart={tp.view.start}
-          viewEnd={tp.view.end}
-          currentTime={tp.effectiveCurrent}
-          onSeek={tp.seekTo}
-          onScrubPreview={tp.setPreviewMs}
-          onZoomAt={tp.zoomAt}
-          onPan={tp.panBy}
-          motion={tp.motionByCam[view.single] ?? null}
-        />
       ) : (
-        <MultiCamTimeline
-          rows={quadRows}
+        <ActivityTimeline
+          rows={timelineRows}
           viewStart={tp.view.start}
           viewEnd={tp.view.end}
           currentTime={tp.effectiveCurrent}
@@ -576,9 +569,10 @@ export function PhoneRecordings() {
           onScrubPreview={tp.setPreviewMs}
           onZoomAt={tp.zoomAt}
           onPan={tp.panBy}
+          labels={view.mode === 'quad'}
+          rowHeight={view.mode === 'quad' ? 18 : 56}
           activeId={target}
           onRowClick={(id) => view.focusTile(Math.max(0, view.quad.indexOf(id)))}
-          rowHeight={18}
         />
       )}
     </div>
