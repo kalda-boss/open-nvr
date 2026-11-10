@@ -172,6 +172,10 @@ export function AppShell() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   useEffect(() => { setDrawerOpen(false) }, [location.pathname, isNarrow])
   const expanded = isNarrow || sidebarOpen
+  // A phone's top bar has no room for "EN — ENGLISH": the bar grew wider
+  // than the screen, and a page wider than the screen throws off everything
+  // pinned to the viewport (dialogs, toasts, the fullscreen video views).
+  const isPhoneBar = useMediaQuery('(max-width: 639px)')
 
   // Escape closes the account menu and the drawer, like every other popup.
   useEffect(() => {
@@ -344,7 +348,7 @@ export function AppShell() {
           size with tooltips — labelled buttons of five different widths
           read as a toolbar spilled across the bar. No `uppercase` here:
           it was leaking into every menu opened from the bar. */}
-      <header className="sticky top-0 z-40 grid h-12 grid-cols-[1fr_auto_1fr] items-center gap-4 border-b border-[var(--border)] bg-[var(--bg-2)] px-4 text-sm text-[var(--text)]">
+      <header className="sticky top-0 z-40 grid h-12 grid-cols-[1fr_auto_1fr] items-center gap-1 border-b border-[var(--border)] bg-[var(--bg-2)] px-2 text-sm text-[var(--text)] sm:gap-4 sm:px-4">
         <div className="flex items-center gap-1 justify-self-start">
           {isNarrow && (
             <button
@@ -358,7 +362,7 @@ export function AppShell() {
             </button>
           )}
           <Link to="/" className="inline-flex items-center" aria-label="OpenNVR home">
-            <Logo className="h-10 w-auto text-[var(--text)]" />
+            <Logo className="h-8 w-auto text-[var(--text)] sm:h-10" />
           </Link>
         </div>
 
@@ -398,12 +402,12 @@ export function AppShell() {
               aria-label={t('language.label')}
               className="h-8 cursor-pointer appearance-none bg-transparent pr-2 text-xs font-medium uppercase text-inherit outline-none"
             >
-              <option value="en">EN — {t('language.english')}</option>
-              <option value="fr">FR — {t('language.french')}</option>
+              <option value="en">{isPhoneBar ? 'EN' : `EN — ${t('language.english')}`}</option>
+              <option value="fr">{isPhoneBar ? 'FR' : `FR — ${t('language.french')}`}</option>
             </select>
           </label>
 
-          <span aria-hidden className="mx-2 h-6 w-px bg-[var(--border)]" />
+          <span aria-hidden className="mx-2 h-6 w-px bg-[var(--border)] max-sm:hidden" />
 
           <div className="relative" ref={accountMenuRef}>
             <button
