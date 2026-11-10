@@ -166,6 +166,64 @@ export function motionPeak(
   return { peak, pending, scored }
 }
 
+export interface MotionBucket {
+  /** Bar height, 0..1; 0 when nothing moved (or there is nothing to say). */
+  level: number
+  /** Mostly footage the server has not scored yet. */
+  pending: boolean
+}
+
+/**
+ * [fromMs, toMs) as `count` equal buckets, for an activity bar chart.
+ *
+ * A bucket's height answers a different question at each zoom. Across a day
+ * one bar is a quarter of an hour, and the tallest second in it says little:
+ * nearly every daytime bar would be full. There the height is how much of
+ * the bucket had activity (seconds at or above MOTION_EVENT, square-rooted
+ * so one person walking through still shows). Zoomed in to a few seconds a
+ * bar, a bucket is either active or not, and the height is how strong the
+ * motion was (motionLevel of the peak). In between the two are blended.
+ */
+export function motionBuckets(
+  track: MotionTrack,
+  fromMs: number,
+  toMs: number,
+  count: number
+): MotionBucket[] {
+  const { values, startMs, stepMs } = track
+  const n = Math.max(1, Math.floor(count))
+  const width = (toMs - fromMs) / n
+  const mix = Math.max(0, Math.min(1, (width / 1000 - 5) / 55))
+  const out: MotionBucket[] = []
+  for (let b = 0; b < n; b++) {
+    const a = fromMs + b * width
+    const i0 = Math.max(0, Math.floor((a - startMs) / stepMs))
+    const i1 = Math.min(values.length, Math.ceil((a + width - startMs) / stepMs))
+    let peak = 0
+    let scored = 0
+    let pending = 0
+    let active = 0
+    for (let i = i0; i < i1; i++) {
+      const v = values[i]
+      if (v === MOTION_PENDING) pending++
+      else if (v < MOTION_PENDING) {
+        scored++
+        if (v >= MOTION_EVENT) active++
+        if (v > peak) peak = v
+      }
+    }
+    const strength = motionLevel(peak)
+    if (strength === 0) {
+      out.push({ level: 0, pending: pending > scored })
+      continue
+    }
+    // Below MOTION_EVENT is a twitch, not an event: a stub, never a bar.
+    const share = active > 0 ? 0.18 + 0.82 * Math.sqrt(active / scored) : 0.1
+    out.push({ level: mix * share + (1 - mix) * strength, pending: false })
+  }
+  return out
+}
+
 /** Runs of activity (score >= threshold), joined across quiet gaps of up to
  *  `mergeGapMs` so one person pausing mid-frame stays one event, without
  *  one-off blips (see MOTION_EVENT_MIN_MS). */

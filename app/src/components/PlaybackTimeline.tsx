@@ -129,6 +129,15 @@ export function PlaybackTimeline({
   const lastXRef = useRef(0)
   const selAnchorRef = useRef<number | null>(null)
   const [dragging, setDragging] = useState(false)
+  // The same flag for the effect below, which can run after a release was
+  // handled but from a render that still saw the drag: React flushes a
+  // pending effect just before it renders the release, so its preview
+  // would land after the release cleared it and stick.
+  const draggingRef = useRef(false)
+  const setDrag = (on: boolean) => {
+    draggingRef.current = on
+    setDragging(on)
+  }
   const [hoverMs, setHoverMs] = useState<number | null>(null)
   const [hoverX, setHoverX] = useState(0)
 
@@ -241,7 +250,7 @@ export function PlaybackTimeline({
   const handleDown = (e: React.PointerEvent) => {
     if (!e.isPrimary) return
     e.currentTarget.setPointerCapture(e.pointerId)
-    setDragging(true)
+    setDrag(true)
     lastXRef.current = e.clientX
     autoPan.onDragStart(e.clientX)
     setHover(e.clientX)
@@ -272,7 +281,7 @@ export function PlaybackTimeline({
   const handleUp = (e: React.PointerEvent) => {
     if (!dragging) return
     autoPan.onDragEnd()
-    setDragging(false)
+    setDrag(false)
     if (mode === 'clip') {
       const a = selAnchorRef.current
       selAnchorRef.current = null
@@ -293,7 +302,7 @@ export function PlaybackTimeline({
   const handleCancel = () => {
     if (!dragging) return
     autoPan.onDragEnd()
-    setDragging(false)
+    setDrag(false)
     setHoverMs(null)
     if (mode === 'clip') {
       selAnchorRef.current = null
@@ -306,7 +315,7 @@ export function PlaybackTimeline({
   // re-derive the drag target from the moving window instead. During a drag
   // the window only moves via onPan (auto-follow is suppressed by the preview).
   useEffect(() => {
-    if (!dragging) return
+    if (!draggingRef.current) return
     setHover(lastXRef.current)
     if (mode === 'clip' && selAnchorRef.current != null) {
       const t = xToMs(lastXRef.current)
