@@ -58,6 +58,12 @@ interface SyncPlaybackTileProps {
   /** Whether the loaded clip has sound (cameras without a mic, or with AAC
       sound, have none to play). */
   onSound?: (cameraId: number, hasSound: boolean) => void
+  /** Fill the parent box instead of sizing itself (16:9 below `lg`, a grid
+      cell above). The phone view gives every tile a sized box. */
+  fill?: boolean
+  /** Leave out the name band and the selection ring: the parent draws its
+      own (the phone view's camera name is a menu). */
+  bare?: boolean
 }
 
 type TileStatus = 'idle' | 'loading' | 'ok' | 'gap' | 'live' | 'error'
@@ -87,6 +93,8 @@ export function SyncPlaybackTile({
   fisheye,
   voiceFocus = 'off',
   onSound,
+  fill = false,
+  bare = false,
 }: SyncPlaybackTileProps) {
   const { t } = useTranslation()
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -418,7 +426,9 @@ export function SyncPlaybackTile({
   return (
     <div
       onClick={onActivate}
-      className="relative bg-black overflow-hidden cursor-pointer flex items-center justify-center aspect-video lg:aspect-auto"
+      className={`relative bg-black overflow-hidden cursor-pointer flex items-center justify-center ${
+        fill ? 'w-full h-full' : 'aspect-video lg:aspect-auto'
+      }`}
       style={{ containerType: 'size' }}
     >
       {/* The clip carries the camera's coded size, which for an anamorphic
@@ -461,14 +471,18 @@ export function SyncPlaybackTile({
       {/* Label band, as on Live View and the dashboard wall: legible over
           any picture without a solid bar. The speaker marks the tile whose
           audio is playing. */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-9 bg-gradient-to-b from-black/75 to-transparent" />
-      <div className="pointer-events-none absolute left-2 right-2 top-1.5 z-10 flex items-center gap-1.5 text-white">
-        <span className="text-[11px] font-medium truncate [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">{cameraName}</span>
-        {active && !muted && <Volume2 size={11} className="shrink-0 text-[var(--accent)]" aria-hidden="true" />}
-      </div>
+      {!bare && (
+        <>
+          <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-9 bg-gradient-to-b from-black/75 to-transparent" />
+          <div className="pointer-events-none absolute left-2 right-2 top-1.5 z-10 flex items-center gap-1.5 text-white">
+            <span className="text-[11px] font-medium truncate [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">{cameraName}</span>
+            {active && !muted && <Volume2 size={11} className="shrink-0 text-[var(--accent)]" aria-hidden="true" />}
+          </div>
+        </>
+      )}
 
       {/* Selected tile: an inset ring, so the hairline grid never shifts. */}
-      {active && <div className="pointer-events-none absolute inset-0 z-20 ring-1 ring-inset ring-[var(--accent)]" />}
+      {active && !bare && <div className="pointer-events-none absolute inset-0 z-20 ring-1 ring-inset ring-[var(--accent)]" />}
 
       {showSpinner && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/30 pointer-events-none">
@@ -478,7 +492,7 @@ export function SyncPlaybackTile({
 
       {(status === 'gap' || status === 'idle') && (
         <div
-          className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 text-white/45 pointer-events-none"
+          className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-2 text-center text-white/45 pointer-events-none"
           style={{ background: 'repeating-linear-gradient(135deg, #07090d 0 10px, #0b0f16 10px 20px)' }}
         >
           <CameraOff size={18} />
@@ -487,14 +501,14 @@ export function SyncPlaybackTile({
       )}
 
       {status === 'live' && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 pointer-events-none">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-center bg-black/70 pointer-events-none">
           <Radio size={18} className="text-[var(--on-video-ok)] animate-pulse" />
           <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-[var(--on-video)]">{t('shared.stillRecording')}</span>
         </div>
       )}
 
       {status === 'error' && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 pointer-events-none">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-center bg-black/70 pointer-events-none">
           <AlertCircle size={18} className="text-[var(--on-video-warn)]" />
           <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-[var(--on-video-warn)]">{t('shared.playbackFailed')}</span>
         </div>

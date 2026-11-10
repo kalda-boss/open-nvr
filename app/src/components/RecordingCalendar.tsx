@@ -26,6 +26,8 @@ interface RecordingCalendarProps {
   onSelect: (date: string) => void
   /** Days that have footage — get a marker and stronger text. */
   markedDates: Set<string>
+  /** `touch` enlarges the day cells and month arrows to finger size. */
+  size?: 'compact' | 'touch'
   className?: string
 }
 
@@ -45,8 +47,10 @@ function parseKey(s: string | null): { y: number; m: number } | null {
  * with footage are marked with an accent dot, the selected day is filled.
  * Day keys are plain date-string arithmetic — no Date/timezone conversion.
  */
-export function RecordingCalendar({ selected, onSelect, markedDates, className = '' }: RecordingCalendarProps) {
+export function RecordingCalendar({ selected, onSelect, markedDates, size = 'compact', className = '' }: RecordingCalendarProps) {
   const { t } = useTranslation()
+  const touch = size === 'touch'
+  const arrowClass = `${touch ? 'w-11 h-11 flex items-center justify-center' : 'p-1'} text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--panel-2)]`
   const WEEKDAYS = t('calendar.weekdays').split(',')
   const MONTHS = t('calendar.months').split(',')
   const today = new Date()
@@ -97,20 +101,20 @@ export function RecordingCalendar({ selected, onSelect, markedDates, className =
       <div className="flex items-center justify-between mb-1.5">
         <button
           onClick={() => step(-1)}
-          className="p-1 text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--panel-2)]"
+          className={arrowClass}
           aria-label={t('calendar.previousMonth')}
         >
-          <ChevronLeft size={15} />
+          <ChevronLeft size={touch ? 18 : 15} />
         </button>
         <span className="text-sm font-medium">
           {MONTHS[view.m]} {view.y}
         </span>
         <button
           onClick={() => step(1)}
-          className="p-1 text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--panel-2)]"
+          className={arrowClass}
           aria-label={t('calendar.nextMonth')}
         >
-          <ChevronRight size={15} />
+          <ChevronRight size={touch ? 18 : 15} />
         </button>
       </div>
 
@@ -135,7 +139,9 @@ export function RecordingCalendar({ selected, onSelect, markedDates, className =
               key={i}
               onClick={() => onSelect(k)}
               title={marked ? `${k} · ${t('calendar.hasRecordings')}` : k}
-              className={`relative mx-auto w-7 h-7 flex items-center justify-center text-[11px] transition-colors ${
+              className={`relative mx-auto flex items-center justify-center transition-colors ${
+                touch ? 'w-10 h-10 text-sm' : 'w-7 h-7 text-[11px]'
+              } ${
                 isSelected
                   ? 'bg-[var(--accent)] text-white font-semibold'
                   : c.outside

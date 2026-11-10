@@ -17,7 +17,6 @@
  */
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
 import {
   Play,
   Pause,
@@ -42,104 +41,48 @@ import {
   ChevronRight,
 } from 'lucide-react'
 import { warmHls } from '../lib/loadHls'
-import {
-  MOTION_PRE_ROLL_MS,
-  combineMotion,
-  motionEvents,
-  nextMotionEvent,
-  parseMotion,
-  prevMotionEvent,
-  skipQuietTarget,
-  type MotionTrack,
-} from '../lib/motion'
-import {
-  useCameraAspects,
-  useMotionForCameras,
-  useRecordingsByDate,
-  useSegmentsForCameras,
-} from '../lib/queries'
-import { localDateKey, localDayEnd, localDayStart, todayLocalKey } from '../lib/time'
+import { useCameraAspects } from '../lib/queries'
+import { formatDuration, localDateKey } from '../lib/time'
 import { useSnackbar } from '../components/Snackbar'
-import { useTranslation, useDateFormat, type DateFormatters } from '../i18n'
+import { useTranslation, useDateFormat } from '../i18n'
 import { RecordingCalendar } from '../components/RecordingCalendar'
 import { PaneResizer } from '../components/PaneResizer'
 import { useElementSize } from '../hooks/useElementSize'
+import { useIsPhoneLayout } from '../hooks/useIsPhoneLayout'
 import { usePaneExtra } from '../hooks/usePaneExtra'
 import { MultiCamTimeline, type TimelineRow } from '../components/MultiCamTimeline'
 import { SyncPlaybackTile } from '../components/SyncPlaybackTile'
 import { VoiceFocusButton } from '../components/VoiceFocusButton'
-import { primeAudioOutput, readVoiceFocusPref, type VoiceFocusLevel } from '../lib/voiceFocus'
-import type { TimelineSegment } from '../components/PlaybackTimeline'
+import { PhoneRecordings } from './playback/PhoneRecordings'
+import {
+  MAX_TILES,
+  SPEEDS,
+  ZOOMS,
+  formatDateLong,
+  latestDay,
+  usePlaybackDeepLink,
+  usePlaybackSound,
+  useRecordingsOverview,
+  useSyncTransport,
+  type DailyRecording,
+  type OverviewCamera,
+} from './playback/syncPlaybackEngine'
 
-interface DailyRecording {
-  date: string
-  total_duration: number
-  segment_count: number
-  first_start: string
-  playback_url: string | null
-}
-
-interface OverviewCamera {
-  camera_id: number
-  camera_name: string
-  path: string
-  recording_count: number
-  total_duration: number
-  recordings: DailyRecording[]
-}
-
-interface RawSegment {
-  start: string
-  duration: number
-  playback_url: string
-}
-
-const ZOOMS: { label: string; span: number }[] = [
-  { label: '24h', span: 24 * 3600_000 },
-  { label: '6h', span: 6 * 3600_000 },
-  { label: '1h', span: 3600_000 },
-  { label: '10m', span: 600_000 },
-]
-
-const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16]
-const RATE_1X = 2
-/** Grid limit — also keeps concurrent HLS sessions within the server cap. */
-const MAX_TILES = 4
 /** Least height the video wall keeps when the timeline pane is dragged
  *  taller, and the most the pane may grow (a phone's page is not
  *  height-bound, so nothing else stops it). */
 const MIN_GRID_PX = 160
 const MAX_PANE_EXTRA_PX = 480
 
-const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
-
-function parseSegments(raw: RawSegment[]): TimelineSegment[] {
-  return raw
-    .map((r) => {
-      const startMs = Date.parse(r.start)
-      return { startMs, endMs: startMs + (r.duration || 0) * 1000 }
-    })
-    .filter((s) => Number.isFinite(s.startMs))
-    .sort((a, b) => a.startMs - b.startMs)
-}
-
-// Day windows are LOCAL days (midnight -> midnight in the browser's zone),
-// matching the API's local-day grouping — see lib/time.ts.
-
-function formatDuration(seconds: number) {
-  const hours = Math.floor(seconds / 3600)
-  const mins = Math.floor((seconds % 3600) / 60)
-  return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`
-}
-
-function formatDateLong(date: string, fmt: DateFormatters) {
-  const [y, m, d] = date.split('-').map(Number)
-  return fmt.date(new Date(y, m - 1, d), {
-    weekday: 'short',
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-  })
+/**
+ * Recordings. Phones get their own view, one camera (or four) with the
+ * timeline and every camera underneath to tap; everything wider gets the
+ * grid with the calendar and checklist beside it. Chosen in JS, not CSS, so
+ * only one of them holds playback sessions. Both run on the engine in
+ * views/playback/syncPlaybackEngine.ts.
+ */
+export function SyncPlayback() {
+  return useIsPhoneLayout() ? <PhoneRecordings /> : <DesktopSyncPlayback />
 }
 
 /**
@@ -147,10 +90,10 @@ function formatDateLong(date: string, fmt: DateFormatters) {
  * wall-clock instant, a calendar marking days that have footage, a camera
  * checklist, and one multi-track timeline driving every tile.
  */
-export function SyncPlayback() {
+function DesktopSyncPlayback() {
   const fmt = useDateFormat()
   const { t } = useTranslation()
-  const { showError, showInfo } = useSnackbar()
+  const { showError } = useSnackbar()
   const stageRef = useRef<HTMLDivElement>(null)
   // Per-camera display-aspect settings for the grid tiles (#354).
   const cameraAspects = useCameraAspects()
@@ -162,43 +105,18 @@ export function SyncPlayback() {
   }, [])
 
   // ---- Overview: which cameras have recordings on which days ---------------
-  // react-query: cached across navigations (Dashboard -> Recordings renders
-  // instantly from cache), deduped across concurrent mounts.
-  const overviewQuery = useRecordingsByDate()
-  const overview = (overviewQuery.data?.cameras as OverviewCamera[] | undefined) ?? null
-  const overviewLoading = overviewQuery.isPending
-  const overviewError = overviewQuery.error
-    ? ((overviewQuery.error as any)?.message === 'API_NETWORK_ERROR'
-      ? t('dashboard.failedRecordings')
-      : (overviewQuery.error as any)?.message || t('dashboard.failedRecordings'))
-    : null
-  const mediamtxAvailable = overviewQuery.data?.mediamtx_available !== false
-  const loadOverview = overviewQuery.refetch
+  const {
+    overview,
+    loading: overviewLoading,
+    error: overviewError,
+    mediamtxAvailable,
+    reload: loadOverview,
+    markedDates,
+    recByCamDate,
+  } = useRecordingsOverview()
 
-  // ---- Deep link -----------------------------------------------------------
-  //
-  // ``/playback/sync?camera=3&at=2026-09-18T14:32:07Z`` opens on that camera,
-  // that day, with the playhead at that instant. Search results, alarms and
-  // the app pages all end at a camera and a moment; without this they end at
-  // a timestamp the operator has to find by hand, which is most of the work.
-  //
-  // Read ONCE, in the state initialisers: a later read would fight the
-  // day-selection effect below, and an operator who then scrubs somewhere
-  // else must not be yanked back by their own URL.
-  const [searchParams] = useSearchParams()
-  const deepLink = useRef<{ camera: number | null; atMs: number | null } | null>(null)
-  if (deepLink.current === null) {
-    const rawCam = Number(searchParams.get('camera'))
-    const rawAt = Date.parse(searchParams.get('at') || '')
-    deepLink.current = {
-      camera: Number.isFinite(rawCam) && rawCam > 0 ? rawCam : null,
-      atMs: Number.isFinite(rawAt) ? rawAt : null,
-    }
-  }
-  const link = deepLink.current
-  //: Consumed by the per-day initialiser below, then cleared — so it seeks
-  //: once rather than every time the day's segments reload.
-  const pendingSeekMs = useRef<number | null>(link.atMs)
+  // ---- Deep link (?camera=&at=), read once ---------------------------------
+  const link = usePlaybackDeepLink()
 
   // ---- Selection -----------------------------------------------------------
   const [selectedDate, setSelectedDate] = useState<string | null>(
@@ -227,47 +145,40 @@ export function SyncPlayback() {
       return !o
     })
 
-  // ---- Transport (the shared master clock) ---------------------------------
-  const [masterMs, setMasterMs] = useState(0)
-  const [playing, setPlaying] = useState(false)
-  const [rateIdx, setRateIdx] = useState(RATE_1X)
-  // Sound is off on every visit; one tap turns on the selected camera's.
-  const [muted, setMuted] = useState(true)
-  const [voiceFocus, setVoiceFocus] = useState<VoiceFocusLevel>(readVoiceFocusPref)
-  // Which cameras' loaded clips carry sound (false: no mic, or AAC sound).
-  const [soundByCam, setSoundByCam] = useState<Record<number, boolean>>({})
-  const onSound = useCallback(
-    (id: number, has: boolean) => setSoundByCam((m) => (m[id] === has ? m : { ...m, [id]: has })),
-    [],
-  )
-  const toggleMute = () => {
-    if (muted) primeAudioOutput() // inside the click: iOS needs the gesture
-    setMuted(!muted)
-  }
-  const [view, setView] = useState<{ start: number; end: number }>({ start: 0, end: 0 })
-  const [zoomIdx, setZoomIdx] = useState(0)
-  const [previewMs, setPreviewMs] = useState<number | null>(null)
+  // ---- Transport (the shared master clock) and sound -----------------------
+  const {
+    segsByCam,
+    liveEdges,
+    segsLoading,
+    motionByCam,
+    motion,
+    masterMs,
+    playing,
+    rateIdx,
+    view,
+    zoomIdx,
+    setPreviewMs,
+    effectiveCurrent,
+    skipQuiet,
+    toggleSkipQuiet,
+    resetDay,
+    seekTo,
+    togglePlay,
+    jumpToActivity,
+    stop,
+    changeSpeed,
+    applyZoom,
+    panBy,
+    zoomAt,
+  } = useSyncTransport({ selectedIds, selectedDate, initialSeekMs: link.atMs })
+  const { muted, toggleMute, voiceFocus, setVoiceFocus, soundByCam, onSound } = usePlaybackSound()
   const [isFullscreen, setIsFullscreen] = useState(false)
-
-  const masterMsRef = useRef(masterMs)
-  useEffect(() => {
-    masterMsRef.current = masterMs
-  }, [masterMs])
-
-  const dayStart = selectedDate ? localDayStart(selectedDate) : 0
-  const dayEnd = selectedDate ? localDayEnd(selectedDate) : 0
-  const dayBoundsRef = useRef({ start: dayStart, end: dayEnd })
-  dayBoundsRef.current = { start: dayStart, end: dayEnd }
-
-  // Marks masterMs/view as initialized for the current day.
-  const dateInitRef = useRef<string | null>(null)
 
   // Default selection once the overview lands: latest day with footage, and
   // the first few cameras that recorded that day.
   useEffect(() => {
     if (!overview || selectedDate) return
-    let latest: string | null = null
-    for (const c of overview) for (const r of c.recordings) if (!latest || r.date > latest) latest = r.date
+    const latest = latestDay(overview)
     if (!latest) return
     const ids = overview.filter((c) => c.recordings.some((r) => r.date === latest)).map((c) => c.camera_id)
     setSelectedDate(latest)
@@ -277,25 +188,6 @@ export function SyncPlayback() {
     setSelectedIds(link.camera != null ? [link.camera] : ids.slice(0, MAX_TILES))
     setActiveId(link.camera ?? ids[0] ?? null)
   }, [overview, selectedDate, link.camera])
-
-  // ---- Derived: calendar marks, per-date availability ----------------------
-  const markedDates = useMemo(() => {
-    const s = new Set<string>()
-    for (const c of overview || []) for (const r of c.recordings) s.add(r.date)
-    return s
-  }, [overview])
-
-  // O(1) lookups instead of scanning every camera's recordings array on
-  // every render (the checklist used to do that 4x/second on clock ticks).
-  const recByCamDate = useMemo(() => {
-    const m = new Map<number, Map<string, DailyRecording>>()
-    for (const c of overview || []) {
-      const dm = new Map<string, DailyRecording>()
-      for (const r of c.recordings) dm.set(r.date, r)
-      m.set(c.camera_id, dm)
-    }
-    return m
-  }, [overview])
 
   // Footage recorded on the selected day: total seconds + cameras that have any.
   const dayTotal = useMemo(() => {
@@ -312,159 +204,6 @@ export function SyncPlayback() {
     return { seconds, cams }
   }, [overview, recByCamDate, selectedDate])
 
-  // ---- Fetch segments for the selected cameras/day -------------------------
-  // One react-query per camera+day. Polling (today only) is handled by the
-  // hook; structural sharing keeps unchanged responses referentially stable,
-  // so a poll tick that changes nothing invalidates nothing downstream —
-  // the old hand-rolled loop replaced every array on every tick and re-fired
-  // every tile's follow loop.
-  const segQueries = useSegmentsForCameras(selectedIds, selectedDate, { poll: true })
-
-  // Fixed-length deps (MAX_TILES = 4) keep the hook contract while still
-  // recomputing only when a query's (structurally shared) data changes.
-  const segData0 = segQueries[0]?.data
-  const segData1 = segQueries[1]?.data
-  const segData2 = segQueries[2]?.data
-  const segData3 = segQueries[3]?.data
-
-  const segsByCam = useMemo(() => {
-    const datas = [segData0, segData1, segData2, segData3]
-    const out: Record<number, TimelineSegment[]> = {}
-    selectedIds.forEach((id, i) => {
-      out[id] = parseSegments((datas[i]?.segments as RawSegment[]) || [])
-    })
-    return out
-  }, [selectedIds, segData0, segData1, segData2, segData3])
-
-  const liveEdges = useMemo(() => {
-    const datas = [segData0, segData1, segData2, segData3]
-    const out: Record<number, number | null> = {}
-    selectedIds.forEach((id, i) => {
-      const raw = datas[i]?.live_edge_start
-      const edge = raw ? Date.parse(raw) : NaN
-      out[id] = Number.isFinite(edge) ? edge : null
-    })
-    return out
-  }, [selectedIds, segData0, segData1, segData2, segData3])
-
-  const segsLoading =
-    selectedIds.length > 0 && segQueries.some((q) => q.isPending)
-
-  // ---- Motion activity (motion on each timeline row; jumps, skip-quiet) ----
-  // The shared playhead rides along so the server scores the clips around
-  // it first (none until the day has placed it).
-  const motionQueries = useMotionForCameras(selectedIds, selectedDate, previewMs ?? (masterMs || undefined))
-  const motionData0 = motionQueries[0]?.data
-  const motionData1 = motionQueries[1]?.data
-  const motionData2 = motionQueries[2]?.data
-  const motionData3 = motionQueries[3]?.data
-  const motionByCam = useMemo(() => {
-    const datas = [motionData0, motionData1, motionData2, motionData3]
-    const out: Record<number, MotionTrack | null> = {}
-    selectedIds.forEach((id, i) => {
-      out[id] = parseMotion(datas[i])
-    })
-    return out
-  }, [selectedIds, motionData0, motionData1, motionData2, motionData3])
-  // Every selected camera as one track: a jump stops for any of them.
-  const motion = useMemo(
-    () => combineMotion(selectedIds.map((id) => motionByCam[id]).filter((m): m is MotionTrack => !!m)),
-    [selectedIds, motionByCam]
-  )
-  const activity = useMemo(() => motionEvents(motion), [motion])
-  const [skipQuiet, setSkipQuiet] = useState(false)
-  // The master clock runs in an interval; it reads these through refs.
-  const skipRef = useRef({ on: false, motion, activity, endSaid: false })
-  skipRef.current.on = skipQuiet
-  skipRef.current.motion = motion
-  skipRef.current.activity = activity
-  const sayNoMoreRef = useRef(() => {})
-  sayNoMoreRef.current = () => showInfo(t('playback.noActivityAfter'))
-
-  // Union of all selected cameras' footage — used for snapping, gap skipping
-  // and picking the day's starting instant.
-  const unionSegs = useMemo(() => {
-    const all = Object.values(segsByCam).flat()
-    return all.sort((a, b) => a.startMs - b.startMs)
-  }, [segsByCam])
-  const unionRef = useRef(unionSegs)
-  useEffect(() => {
-    unionRef.current = unionSegs
-  }, [unionSegs])
-
-  // Initialize the playhead and window once per selected day.
-  useEffect(() => {
-    if (segsLoading || !selectedDate) return
-    if (dateInitRef.current === selectedDate) return
-    if (Object.keys(segsByCam).length === 0) return
-    dateInitRef.current = selectedDate
-    const first = unionSegs.length ? unionSegs[0].startMs : dayStart
-    // A deep link asked for an instant: honour it, clamped into the day, and
-    // spend it — reloads of this day's segments must not drag the playhead
-    // back to where the link pointed an hour ago.
-    const asked = pendingSeekMs.current
-    pendingSeekMs.current = null
-    setMasterMs(
-      asked != null && asked >= dayStart && asked < dayEnd ? asked : first,
-    )
-    setView({ start: dayStart, end: dayEnd })
-    setZoomIdx(0)
-    setPlaying(true)
-  }, [segsLoading, selectedDate, segsByCam, unionSegs, dayStart, dayEnd])
-
-  // ---- Master clock: advances wall-clock time, skipping global gaps --------
-  useEffect(() => {
-    if (!playing) return
-    let last = performance.now()
-    const id = setInterval(() => {
-      const now = performance.now()
-      const delta = (now - last) * SPEEDS[rateIdx]
-      last = now
-      let next = masterMsRef.current + delta
-      const u = unionRef.current
-      // Dead air where NO selected camera has footage is skipped to the next
-      // recorded instant instead of played through in real time.
-      if (!u.some((s) => next >= s.startMs && next < s.endMs)) {
-        const nx = u.find((s) => s.startMs > next)
-        if (nx) next = nx.startMs
-        else {
-          setPlaying(false)
-          return
-        }
-      }
-      // Skip-quiet: past the end of a stretch of motion, go to the next one.
-      const sq = skipRef.current
-      if (sq.on && sq.motion) {
-        const target = skipQuietTarget(sq.motion, sq.activity, next)
-        if (typeof target === 'number') next = target
-        else if (target === 'end' && !sq.endSaid) {
-          sq.endSaid = true
-          sayNoMoreRef.current()
-        }
-      }
-      // Never chase into footage still being written (or the end of the day).
-      const cap = Math.min(Date.now() - 60_000, dayBoundsRef.current.end - 1)
-      if (next >= cap) {
-        setPlaying(false)
-        next = Math.min(masterMsRef.current, cap)
-      }
-      setMasterMs(next)
-    }, 250)
-    return () => clearInterval(id)
-  }, [playing, rateIdx])
-
-  // Keep the playhead inside the visible window while playing (auto-follow).
-  useEffect(() => {
-    if (previewMs != null) return
-    if (masterMs < view.start || masterMs > view.end) {
-      const span = view.end - view.start
-      if (span <= 0) return
-      let start = clamp(masterMs - span / 2, dayStart, dayEnd - span)
-      if (span >= dayEnd - dayStart) start = dayStart
-      setView({ start, end: start + span })
-    }
-  }, [masterMs, previewMs, view.start, view.end, dayStart, dayEnd])
-
   // Fullscreen tracking.
   useEffect(() => {
     const onFs = () => setIsFullscreen(!!document.fullscreenElement)
@@ -478,9 +217,7 @@ export function SyncPlayback() {
     if (!markedDates.has(date)) return // nothing recorded that day
     const avail = (overview || []).filter((c) => c.recordings.some((r) => r.date === date)).map((c) => c.camera_id)
     setSelectedDate(date)
-    dateInitRef.current = null
-    skipRef.current.endSaid = false
-    setPlaying(false)
+    resetDay()
     setSelectedIds((prev) => {
       const kept = prev.filter((id) => avail.includes(id))
       return kept.length ? kept : avail.slice(0, 1)
@@ -504,75 +241,6 @@ export function SyncPlayback() {
       })
     },
     [showError]
-  )
-
-  const seekTo = (ms: number) => {
-    setMasterMs(clamp(ms, dayStart, dayEnd - 1))
-  }
-
-  const togglePlay = () => setPlaying((p) => !p)
-
-  // Jump to the next / previous stretch of motion on any selected camera.
-  const jumpToActivity = (dir: 1 | -1) => {
-    const at = previewMs ?? masterMs
-    const ev = dir > 0 ? nextMotionEvent(activity, at) : prevMotionEvent(activity, at)
-    if (!ev) {
-      showInfo(t(dir > 0 ? 'playback.noActivityAfter' : 'playback.noActivityBefore'))
-      return
-    }
-    seekTo(ev.startMs - MOTION_PRE_ROLL_MS)
-  }
-
-  const stop = () => {
-    setPlaying(false)
-    setMasterMs(unionSegs.length ? unionSegs[0].startMs : dayStart)
-  }
-
-  const changeSpeed = (dir: 1 | -1) => setRateIdx((i) => clamp(i + dir, 0, SPEEDS.length - 1))
-
-  const applyZoom = (idx: number) => {
-    const span = ZOOMS[idx].span
-    setZoomIdx(idx)
-    const center = previewMs ?? masterMs
-    const total = dayEnd - dayStart
-    if (span >= total) {
-      setView({ start: dayStart, end: dayEnd })
-      return
-    }
-    const start = clamp(center - span / 2, dayStart, dayEnd - span)
-    setView({ start, end: start + span })
-  }
-
-  // Edge auto-scroll while scrubbing: shift the window, keep the span (and
-  // the active zoom preset). Returning the same object when clamped-unchanged
-  // avoids re-render churn at the day boundaries.
-  const panBy = useCallback(
-    (deltaMs: number) => {
-      setView((v) => {
-        const span = v.end - v.start
-        if (span <= 0) return v
-        const start = clamp(v.start + deltaMs, dayStart, Math.max(dayStart, dayEnd - span))
-        return start === v.start ? v : { start, end: start + span }
-      })
-    },
-    [dayStart, dayEnd]
-  )
-
-  const zoomAt = useCallback(
-    (anchorMs: number, factor: number) => {
-      setZoomIdx(-1)
-      setView((v) => {
-        const span = v.end - v.start
-        const total = dayEnd - dayStart
-        const MIN_SPAN = 30_000
-        const newSpan = clamp(span * factor, MIN_SPAN, total)
-        if (newSpan >= total) return { start: dayStart, end: dayEnd }
-        const rel = span > 0 ? (anchorMs - v.start) / span : 0.5
-        const start = clamp(anchorMs - rel * newSpan, dayStart, dayEnd - newSpan)
-        return { start, end: start + newSpan }
-      })
-    },
-    [dayStart, dayEnd]
   )
 
   const toggleFullscreen = () => {
@@ -600,7 +268,6 @@ export function SyncPlayback() {
     [selectedCams, segsByCam, liveEdges, motionByCam]
   )
 
-  const effectiveCurrent = previewMs ?? masterMs
   const activeCam = selectedCams.find((c) => c.camera_id === activeId)
 
   // ---- Resizable bottom pane ---------------------------------------------
@@ -776,10 +443,7 @@ export function SyncPlayback() {
               <button
                 title={t(skipQuiet ? 'playback.skipQuietOn' : 'playback.skipQuiet')}
                 aria-pressed={skipQuiet}
-                onClick={() => {
-                  skipRef.current.endSaid = false
-                  setSkipQuiet((on) => !on)
-                }}
+                onClick={toggleSkipQuiet}
                 className={`p-1 transition-colors ${
                   skipQuiet
                     ? 'bg-[var(--motion)] text-white'
