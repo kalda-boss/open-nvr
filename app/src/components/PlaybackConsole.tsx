@@ -107,10 +107,15 @@ const ZOOMS: { label: string; span: number }[] = [
   { label: '2m', span: 120_000 },
 ]
 
-const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16]
+/** Play speeds, forward or (while rewinding) backward. No slow motion: the
+ *  button that used to step down to 0.25x is now Rewind. */
+const SPEEDS = [1, 2, 4, 8, 16]
 /** Least height the video keeps when the timeline pane is dragged taller. */
 const MIN_VIDEO_PX = 140
-const RATE_1X = 2 // index of 1x in SPEEDS
+const RATE_1X = 0 // index of 1x in SPEEDS
+const RATE_2X = 1 // where Rewind starts, and Fast-forward from a rewind
+/** How often a rewind steps the picture back. */
+const REWIND_TICK_MS = 250
 const FRAME_STEP = 1 / 25 // ~1 frame at 25fps
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
@@ -216,14 +221,20 @@ export function PlaybackConsole({
   const [previewMs, setPreviewMs] = useState<number | null>(null)
   const [isPlaying, setIsPlaying] = useState(false)
   const [rateIdx, setRateIdx] = useState(RATE_1X)
+  // Rewinding: the video stays paused and is stepped back SPEEDS[rateIdx]
+  // seconds per second (browsers can't play video backward).
+  const [rewinding, setRewinding] = useState(false)
   // Sound is off on every visit; the recording's sound (served beside the
   // video-only remux) is fetched only while it's on, at 1x.
   const [muted, setMuted] = useState(true)
   const [voiceFocus, setVoiceFocus] = useState<VoiceFocusLevel>(readVoiceFocusPref)
   const [audioSrc, setAudioSrc] = useState<RecordedAudioSource | null>(null)
-  useRecordedAudio(videoRef, audioSrc, { enabled: !muted && SPEEDS[rateIdx] === 1, voiceFocus })
+  useRecordedAudio(videoRef, audioSrc, { enabled: !muted && SPEEDS[rateIdx] === 1 && !rewinding, voiceFocus })
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [buffering, setBuffering] = useState(false)
+  // The rewind loop runs in an interval; it reads these through refs.
+  const currentMsRef = useRef(0)
+  const bufferingRef = useRef(false)
 
   // Skip-quiet playback: while playing, jump over stretches scored quiet.
   const [skipQuiet, setSkipQuiet] = useState(false)
@@ -608,11 +619,82 @@ export function PlaybackConsole({
     }
   }, [currentMs, previewMs, view.start, view.end, dayStart, dayEnd])
 
+  // ---- Rewind ---------------------------------------------------------------
+  currentMsRef.current = currentMs
+  bufferingRef.current = buffering
+  useEffect(() => {
+    if (!rewinding) return
+    const el = videoRef.current
+    el?.pause()
+    let last = performance.now()
+    const id = setInterval(() => {
+      const v = videoRef.current
+      // Wait for a clip load, or for the decoder to finish the last step
+      // (the time waited is caught up on the next step).
+      if (!v || bufferingRef.current || v.seeking) return
+      const now = performance.now()
+      const target = currentMsRef.current - (now - last) * SPEEDS[rateIdx]
+      last = now
+      const c = loadedClipRef.current
+      if (c && target >= c.startMs) {
+        v.currentTime = Math.max(0, (target - windowStartRef.current) / 1000)
+        setCurrentMs(target)
+        return
+      }
+      // Back past the loaded media: open the footage before it — the same
+      // clip's earlier file, or across the gap to the end of the clip before.
+      const remux = v.currentSrc.includes('/browser.mp4')
+      const inSeg = segs.find((s) => target >= s.startMs && target < s.endMs)
+      if (inSeg) {
+        loadClip(inSeg, (target - inSeg.startMs) / 1000, false, remux)
+        return
+      }
+      let prev: Seg | null = null
+      for (const s of segs) if (s.endMs <= target && (!prev || s.endMs > prev.endMs)) prev = s
+      if (prev) {
+        loadClip(prev, Math.max(0, (prev.endMs - prev.startMs) / 1000 - 1), false, remux)
+        return
+      }
+      // The day's first footage: stop there.
+      setRewinding(false)
+      setRateIdx(RATE_1X)
+      v.playbackRate = 1
+    }, REWIND_TICK_MS)
+    return () => clearInterval(id)
+  }, [rewinding, rateIdx, segs, loadClip])
+
+  // A clip that won't load ends the rewind rather than stepping a dead video.
+  useEffect(() => {
+    if (clipError) setRewinding(false)
+  }, [clipError])
+
+  /** Rewind: play backward from 2x; again for 4x, 8x, 16x. */
+  const rewind = () => {
+    setRateIdx((i) => (rewinding ? Math.min(i + 1, SPEEDS.length - 1) : RATE_2X))
+    setRewinding(true)
+  }
+
+  /** Back to forward play at `idx`, or just the speed if not rewinding. */
+  const forwardAt = (idx: number, play: boolean) => {
+    setRewinding(false)
+    setRateIdx(idx)
+    const el = videoRef.current
+    if (!el) return
+    el.playbackRate = SPEEDS[idx]
+    if (play) el.play().catch(() => {})
+  }
+
+  /** Fast-forward: one speed up. From a rewind, forward again at 2x. */
+  const fastForward = () =>
+    rewinding ? forwardAt(RATE_2X, true) : forwardAt(Math.min(rateIdx + 1, SPEEDS.length - 1), false)
+
   // ---- Controls -------------------------------------------------------------
   const togglePlay = () => {
     const el = videoRef.current
     if (!el) return
-    if (el.paused) el.play().catch(() => {})
+    // From a rewind, Play goes forward again at normal speed.
+    if (rewinding) forwardAt(RATE_1X, true)
+    else if (el.paused) el.play().catch(() => {})
     else el.pause()
   }
 
@@ -679,14 +761,9 @@ export function PlaybackConsole({
   const stepFrame = (dir: 1 | -1) => {
     const el = videoRef.current
     if (!el) return
+    setRewinding(false)
     el.pause()
     el.currentTime = clamp(el.currentTime + dir * FRAME_STEP, 0, el.duration || 0)
-  }
-
-  const changeSpeed = (dir: 1 | -1) => {
-    const next = clamp(rateIdx + dir, 0, SPEEDS.length - 1)
-    setRateIdx(next)
-    if (videoRef.current) videoRef.current.playbackRate = SPEEDS[next]
   }
 
   const toggleMute = () => {
@@ -704,7 +781,11 @@ export function PlaybackConsole({
   // ---- Clip export ----------------------------------------------------------
   const toggleClipMode = () => {
     setClipMode((on) => {
-      if (!on) videoRef.current?.pause() // entering clip mode: pause for precision
+      if (!on) {
+        // entering clip mode: pause for precision
+        setRewinding(false)
+        videoRef.current?.pause()
+      }
       setSelection(null)
       return !on
     })
@@ -952,13 +1033,24 @@ export function PlaybackConsole({
             </IconBtn>
 
             <div className="mx-1 flex items-center gap-1">
-              <IconBtn title="Slower" onClick={() => changeSpeed(-1)}>
+              <IconBtn
+                title={t(rewinding ? 'playback.rewindFaster' : 'playback.rewind')}
+                onClick={rewind}
+                active={rewinding}
+              >
                 <Rewind size={16} />
               </IconBtn>
-              <span className="text-xs font-mono w-8 text-center tabular-nums">
+              <button
+                title={t('playback.normalSpeed')}
+                onClick={() => forwardAt(RATE_1X, rewinding)}
+                className={`text-xs font-mono w-9 text-center tabular-nums hover:bg-[var(--panel)] ${
+                  rewinding ? 'text-[var(--accent)]' : ''
+                }`}
+              >
+                {rewinding ? '−' : ''}
                 {SPEEDS[rateIdx]}x
-              </span>
-              <IconBtn title="Faster" onClick={() => changeSpeed(1)}>
+              </button>
+              <IconBtn title={t(rewinding ? 'playback.forwardAgain' : 'playback.faster')} onClick={fastForward}>
                 <FastForward size={16} />
               </IconBtn>
             </div>
@@ -1114,16 +1206,22 @@ function IconBtn({
   title,
   onClick,
   children,
+  active = false,
 }: {
   title: string
   onClick: () => void
   children: React.ReactNode
+  /** Lit while its mode is on (Rewind while rewinding). */
+  active?: boolean
 }) {
   return (
     <button
       title={title}
       onClick={onClick}
-      className="p-1.5 text-[var(--text)] hover:bg-[var(--panel)] transition-colors"
+      aria-pressed={active || undefined}
+      className={`p-1.5 transition-colors ${
+        active ? 'bg-[var(--accent)] text-white' : 'text-[var(--text)] hover:bg-[var(--panel)]'
+      }`}
     >
       {children}
     </button>

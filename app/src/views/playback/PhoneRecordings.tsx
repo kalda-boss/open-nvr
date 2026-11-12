@@ -463,6 +463,7 @@ export function PhoneRecordings() {
         masterMs={tp.masterMs}
         playing={tp.playing}
         rate={tp.rate}
+        reverse={tp.reverse}
         muted={sound.muted || id !== target}
         active={id === target}
         onActivate={noop}
@@ -618,11 +619,11 @@ export function PhoneRecordings() {
       <Divider />
       {/* Speed: the number is the button; the picker is the phone's own. */}
       <label className="relative h-12 flex-1 min-w-0 max-w-14 flex items-center justify-center font-mono text-[13px] font-semibold tabular-nums text-[var(--text)] active:bg-[var(--panel)]">
-        <span aria-hidden="true">{tp.rate}x</span>
+        <span aria-hidden="true">{tp.reverse ? '−' : ''}{tp.rate}x</span>
         <select
           aria-label={t('playback.speed')}
           value={tp.rateIdx}
-          onChange={(e) => tp.setRateIdx(Number(e.target.value))}
+          onChange={(e) => tp.setSpeed(Number(e.target.value))}
           className="absolute inset-0 w-full h-full opacity-0 text-base"
         >
           {SPEEDS.map((s, i) => (

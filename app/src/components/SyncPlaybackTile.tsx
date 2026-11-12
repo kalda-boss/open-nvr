@@ -45,6 +45,9 @@ interface SyncPlaybackTileProps {
   masterMs: number
   playing: boolean
   rate: number
+  /** Rewinding: the master runs backward, so the tile holds its video
+      paused and steps it back to the master on every tick. */
+  reverse?: boolean
   muted: boolean
   /** Highlighted tile (audio focus). */
   active: boolean
@@ -86,6 +89,7 @@ export function SyncPlaybackTile({
   masterMs,
   playing,
   rate,
+  reverse = false,
   muted,
   active,
   onActivate,
@@ -111,12 +115,20 @@ export function SyncPlaybackTile({
   // Target of the load currently in flight, so the follow loop doesn't spawn
   // a new session on every master tick while one is being set up.
   const inFlightRef = useRef<{ targetMs: number } | null>(null)
+  // Whether the last load came back as a whole remuxed file (its window
+  // reaches back to the file's start) or as an HLS session that begins at
+  // its anchor. Rewinding into the latter anchors earlier — see loadAt.
+  const lastRemuxRef = useRef(true)
+  // The last load's wanted instant and whether it anchored earlier. A
+  // lookback that resolved an earlier file (one ending before the playhead)
+  // must not be repeated for the same instant, or the tile reloads forever.
+  const lastLoadRef = useRef<{ wantMs: number; lookback: boolean } | null>(null)
   // Damper: after a failed load, don't retry until the master moves on. Without
   // this a segment whose metadata overstates its media would cause an endless
   // create-session/404 loop.
   const failRef = useRef<{ targetMs: number } | null>(null)
   const masterRef = useRef(masterMs)
-  const playingRef = useRef(playing)
+  const playingRef = useRef(playing && !reverse)
   const rateRef = useRef(rate)
   const mutedRef = useRef(muted)
 
@@ -125,7 +137,7 @@ export function SyncPlaybackTile({
   // The loaded clip's sound. Fetched only while this tile is heard (selected,
   // unmuted) at 1x — never for the rest of the grid or at speed.
   const [audioSrc, setAudioSrc] = useState<RecordedAudioSource | null>(null)
-  useRecordedAudio(videoRef, audioSrc, { enabled: !muted && rate === 1, voiceFocus })
+  useRecordedAudio(videoRef, audioSrc, { enabled: !muted && rate === 1 && !reverse, voiceFocus })
   const onSoundRef = useRef(onSound)
   onSoundRef.current = onSound
 
@@ -165,12 +177,17 @@ export function SyncPlaybackTile({
    * contains it — merged-file boundaries need no special casing.
    */
   const loadAt = useCallback(
-    async (seg: TimelineSegment, targetMs: number) => {
+    async (seg: TimelineSegment, targetMs: number, lookbackMs = 0) => {
       const el = videoRef.current
       if (!el) return
       const token = ++loadTokenRef.current
-      const anchorMs = clamp(targetMs, seg.startMs, seg.endMs - 1500)
-      inFlightRef.current = { targetMs: anchorMs }
+      const wantMs = clamp(targetMs, seg.startMs, seg.endMs - 1500)
+      // An HLS session's media begins at its anchor, so a rewind anchored at
+      // the playhead would leave it on the next tick. Rewinding anchors
+      // `lookbackMs` earlier and settles forward to the playhead instead.
+      const anchorMs = Math.max(seg.startMs, wantMs - lookbackMs)
+      inFlightRef.current = { targetMs: wantMs }
+      lastLoadRef.current = { wantMs, lookback: anchorMs < wantMs }
       teardownMedia()
       windowRef.current = null
       setAudioSrc(null)
@@ -206,7 +223,7 @@ export function SyncPlaybackTile({
       } catch {
         if (token === loadTokenRef.current) {
           inFlightRef.current = null
-          failRef.current = { targetMs: anchorMs }
+          failRef.current = { targetMs: wantMs }
           setStatus('error')
         }
         return
@@ -221,6 +238,7 @@ export function SyncPlaybackTile({
         settleAtMaster()
       }
 
+      lastRemuxRef.current = browserMp4Url != null
       if (browserMp4Url) {
         // Remux path (H.265, or PCM audio): server-remuxed MP4 played natively. The remuxed
         // file is the whole physical on-disk file, beginning fileOffsetSec
@@ -245,7 +263,7 @@ export function SyncPlaybackTile({
           () => {
             if (token === loadTokenRef.current) {
               inFlightRef.current = null
-              failRef.current = { targetMs: anchorMs }
+              failRef.current = { targetMs: wantMs }
               setBuffering(false)
               setStatus('error')
             }
@@ -310,7 +328,10 @@ export function SyncPlaybackTile({
   // ---- The follow loop: reconcile the tile against the master clock --------
   useEffect(() => {
     masterRef.current = masterMs
-    playingRef.current = playing
+    // Rewinding is not playing as far as the <video> goes: it stays paused
+    // and is stepped back below.
+    const forward = playing && !reverse
+    playingRef.current = forward
     rateRef.current = rate
     mutedRef.current = muted
 
@@ -341,19 +362,28 @@ export function SyncPlaybackTile({
       // in 1.25 s, less than a cold load takes, so a fixed 10 s abandoned
       // every load and started another, never playing and piling work on the
       // server. Allow ~6 s of real time instead.
+      // Rewinding, the master moves the other way: "far" scales behind.
       const inFlight = inFlightRef.current
-      if (inFlight && m > inFlight.targetMs - 10_000 && m < inFlight.targetMs + Math.max(10_000, rate * 6_000)) return
+      const ahead = reverse ? 10_000 : Math.max(10_000, rate * 6_000)
+      const behind = reverse ? Math.max(10_000, rate * 6_000) : 10_000
+      if (inFlight && m > inFlight.targetMs - behind && m < inFlight.targetMs + ahead) return
       // Recent failure at this spot — wait for the master to move on.
       if (failRef.current && Math.abs(failRef.current.targetMs - m) < 5_000) return
-      loadAt(seg, m)
+      // A remuxed clip is the whole file, start included: no lookback needed
+      // (and anchoring earlier could resolve the file before this one).
+      const last = lastLoadRef.current
+      const lookbackMissed = last?.lookback && m > last.wantMs - behind && m <= last.wantMs + 1000
+      loadAt(seg, m, reverse && !lastRemuxRef.current && !lookbackMissed ? 120_000 : 0)
       return
     }
 
     // Inside the loaded media: drift-correct and apply transport state.
     if (el.readyState >= 1) {
       const wallMs = w.startMs + el.currentTime * 1000
-      const tolMs = Math.max(1500, rate * 500)
-      if (Math.abs(wallMs - m) > tolMs) {
+      // Rewinding steps to every tick's instant (a frame every 250 ms), but
+      // never queues a seek behind one the decoder is still working on.
+      const tolMs = reverse ? 100 : Math.max(1500, rate * 500)
+      if (Math.abs(wallMs - m) > tolMs && !(reverse && el.seeking)) {
         try {
           el.currentTime = clamp(
             (m - w.startMs) / 1000,
@@ -367,10 +397,10 @@ export function SyncPlaybackTile({
     }
     if (el.playbackRate !== rate) el.playbackRate = rate
     if (el.muted !== muted) el.muted = muted
-    if (playing && el.paused && !el.ended) el.play().catch(() => {})
-    else if (!playing && !el.paused) el.pause()
+    if (forward && el.paused && !el.ended) el.play().catch(() => {})
+    else if (!forward && !el.paused) el.pause()
     setStatus('ok')
-  }, [masterMs, playing, rate, muted, segments, liveEdgeMs, loadAt])
+  }, [masterMs, playing, rate, reverse, muted, segments, liveEdgeMs, loadAt])
 
   // ---- Video element events ------------------------------------------------
   useEffect(() => {
