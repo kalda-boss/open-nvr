@@ -155,6 +155,7 @@ function DesktopSyncPlayback() {
     masterMs,
     playing,
     rateIdx,
+    reverse,
     view,
     zoomIdx,
     setPreviewMs,
@@ -166,7 +167,9 @@ function DesktopSyncPlayback() {
     togglePlay,
     jumpToActivity,
     stop,
-    changeSpeed,
+    rewind,
+    fastForward,
+    normalSpeed,
     applyZoom,
     panBy,
     zoomAt,
@@ -381,6 +384,7 @@ function DesktopSyncPlayback() {
                 masterMs={masterMs}
                 playing={playing}
                 rate={SPEEDS[rateIdx]}
+                reverse={reverse}
                 muted={muted || cam.camera_id !== activeId}
                 active={cam.camera_id === activeId}
                 onActivate={() => setActiveId(cam.camera_id)}
@@ -403,19 +407,28 @@ function DesktopSyncPlayback() {
               label={t('playback.resizeTimeline')}
             />
           )}
-          <IconBtn title={playing ? 'Pause' : 'Play'} onClick={togglePlay}>
-            {playing ? <Pause size={16} /> : <Play size={16} />}
+          <IconBtn title={playing && !reverse ? 'Pause' : 'Play'} onClick={togglePlay}>
+            {playing && !reverse ? <Pause size={16} /> : <Play size={16} />}
           </IconBtn>
           <IconBtn title="Stop (back to first footage)" onClick={stop}>
             <Square size={13} />
           </IconBtn>
 
           <div className="mx-1 flex items-center gap-0.5">
-            <IconBtn title="Slower" onClick={() => changeSpeed(-1)}>
+            <IconBtn title={t(reverse ? 'playback.rewindFaster' : 'playback.rewind')} onClick={rewind} active={reverse}>
               <Rewind size={14} />
             </IconBtn>
-            <span className="text-[11px] font-mono w-7 text-center tabular-nums">{SPEEDS[rateIdx]}x</span>
-            <IconBtn title="Faster" onClick={() => changeSpeed(1)}>
+            <button
+              title={t('playback.normalSpeed')}
+              onClick={normalSpeed}
+              className={`text-[11px] font-mono w-8 text-center tabular-nums hover:bg-[var(--panel)] ${
+                reverse ? 'text-[var(--accent)]' : ''
+              }`}
+            >
+              {reverse ? '−' : ''}
+              {SPEEDS[rateIdx]}x
+            </button>
+            <IconBtn title={t(reverse ? 'playback.forwardAgain' : 'playback.faster')} onClick={fastForward}>
               <FastForward size={14} />
             </IconBtn>
           </div>
@@ -429,7 +442,7 @@ function DesktopSyncPlayback() {
               {activeCam.camera_name}
               {!muted && soundByCam[activeCam.camera_id] === false
                 ? ` · ${t('playback.noSound')}`
-                : !muted && SPEEDS[rateIdx] !== 1
+                : !muted && (SPEEDS[rateIdx] !== 1 || reverse)
                   ? ` · ${t('playback.soundAt1x')}`
                   : ''}
             </span>
@@ -645,16 +658,22 @@ function IconBtn({
   title,
   onClick,
   children,
+  active = false,
 }: {
   title: string
   onClick: () => void
   children: React.ReactNode
+  /** Lit while its mode is on (Rewind while rewinding). */
+  active?: boolean
 }) {
   return (
     <button
       title={title}
       onClick={onClick}
-      className="p-1 text-[var(--text)] hover:bg-[var(--panel)] transition-colors"
+      aria-pressed={active || undefined}
+      className={`p-1 transition-colors ${
+        active ? 'bg-[var(--accent)] text-white' : 'text-[var(--text)] hover:bg-[var(--panel)]'
+      }`}
     >
       {children}
     </button>

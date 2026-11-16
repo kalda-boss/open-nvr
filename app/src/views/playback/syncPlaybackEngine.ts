@@ -58,8 +58,12 @@ export const ZOOMS: { label: string; span: number }[] = [
   { label: '10m', span: 600_000 },
 ]
 
-export const SPEEDS = [0.25, 0.5, 1, 2, 4, 8, 16]
-export const RATE_1X = 2
+/** Play speeds, forward or (while rewinding) backward. There is no slow
+ *  motion: the button that used to step down to 0.25x is now Rewind. */
+export const SPEEDS = [1, 2, 4, 8, 16]
+export const RATE_1X = 0
+/** Where Rewind starts, and where Fast-forward goes from a rewind. */
+export const RATE_2X = 1
 /** Grid limit — also keeps concurrent HLS sessions within the server cap. */
 export const MAX_TILES = 4
 
@@ -211,6 +215,9 @@ export function useSyncTransport({
   const [masterMs, setMasterMs] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [rateIdx, setRateIdx] = useState(RATE_1X)
+  // Rewinding: the master clock runs backward at SPEEDS[rateIdx]. `playing`
+  // stays true meanwhile; the tiles hold their video paused and step it back.
+  const [reverse, setReverse] = useState(false)
   const [view, setView] = useState<{ start: number; end: number }>({ start: 0, end: 0 })
   const [zoomIdx, setZoomIdx] = useState(0)
   const [previewMs, setPreviewMs] = useState<number | null>(null)
@@ -337,8 +344,31 @@ export function useSyncTransport({
       const now = performance.now()
       const delta = (now - last) * SPEEDS[rateIdx]
       last = now
-      let next = masterMsRef.current + delta
       const u = unionRef.current
+      if (reverse) {
+        // Rewind: back through the footage, over dead air to the end of the
+        // footage before it. Skip-quiet only ever skips forward.
+        let next = masterMsRef.current - delta
+        if (!u.some((s) => next >= s.startMs && next < s.endMs)) {
+          let prev: TimelineSegment | null = null
+          for (const s of u) if (s.endMs <= next && (!prev || s.endMs > prev.endMs)) prev = s
+          // Land a second inside the earlier footage: tiles treat the last
+          // moments of a clip as already past it.
+          if (prev) next = Math.max(prev.startMs, prev.endMs - 1000)
+          // A camera that was only just selected has no footage list yet.
+          else if (segsLoadingRef.current) return
+          else {
+            // Back at the day's first footage: stop there, paused.
+            next = u.length ? u[0].startMs : masterMsRef.current
+            setPlaying(false)
+            setReverse(false)
+            setRateIdx(RATE_1X)
+          }
+        }
+        setMasterMs(Math.max(next, dayBoundsRef.current.start))
+        return
+      }
+      let next = masterMsRef.current + delta
       // Dead air where NO selected camera has footage is skipped to the next
       // recorded instant instead of played through in real time.
       if (!u.some((s) => next >= s.startMs && next < s.endMs)) {
@@ -371,7 +401,7 @@ export function useSyncTransport({
       setMasterMs(next)
     }, 250)
     return () => clearInterval(id)
-  }, [playing, rateIdx])
+  }, [playing, rateIdx, reverse])
 
   // Keep the playhead inside the visible window while playing (auto-follow).
   useEffect(() => {
@@ -418,7 +448,16 @@ export function useSyncTransport({
     if (prev) seekTo(Math.max(prev.startMs, prev.endMs + deltaMs))
   }
 
-  const togglePlay = () => setPlaying((p) => !p)
+  /** Play/pause. From a rewind, Play goes forward again at normal speed. */
+  const togglePlay = () => {
+    if (reverse) {
+      setReverse(false)
+      setRateIdx(RATE_1X)
+      setPlaying(true)
+      return
+    }
+    setPlaying((p) => !p)
+  }
 
   // Jump to the next / previous stretch of motion on any selected camera.
   const jumpToActivity = (dir: 1 | -1) => {
@@ -438,10 +477,39 @@ export function useSyncTransport({
 
   const stop = () => {
     setPlaying(false)
+    setReverse(false)
     setMasterMs(unionSegs.length ? unionSegs[0].startMs : dayStart)
   }
 
-  const changeSpeed = (dir: 1 | -1) => setRateIdx((i) => clamp(i + dir, 0, SPEEDS.length - 1))
+  /** Rewind: play backward from 2x; again for 4x, 8x, 16x. */
+  const rewind = () => {
+    setRateIdx((i) => (reverse ? Math.min(i + 1, SPEEDS.length - 1) : RATE_2X))
+    setReverse(true)
+    setPlaying(true)
+  }
+
+  /** Fast-forward: one speed up. From a rewind, forward again at 2x. */
+  const fastForward = () => {
+    if (reverse) {
+      setReverse(false)
+      setRateIdx(RATE_2X)
+      setPlaying(true)
+      return
+    }
+    setRateIdx((i) => Math.min(i + 1, SPEEDS.length - 1))
+  }
+
+  /** Back to forward at 1x, playing or paused as before. */
+  const normalSpeed = () => {
+    setReverse(false)
+    setRateIdx(RATE_1X)
+  }
+
+  /** Pick a forward speed (the phone's speed menu). */
+  const setSpeed = (idx: number) => {
+    setReverse(false)
+    setRateIdx(clamp(idx, 0, SPEEDS.length - 1))
+  }
 
   const applyZoom = (idx: number) => {
     const span = ZOOMS[idx].span
@@ -501,8 +569,9 @@ export function useSyncTransport({
     masterMs,
     playing,
     rateIdx,
-    setRateIdx,
+    setSpeed,
     rate: SPEEDS[rateIdx],
+    reverse,
     view,
     zoomIdx,
     previewMs,
@@ -517,7 +586,9 @@ export function useSyncTransport({
     togglePlay,
     jumpToActivity,
     stop,
-    changeSpeed,
+    rewind,
+    fastForward,
+    normalSpeed,
     applyZoom,
     panBy,
     zoomAt,
